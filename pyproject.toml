@@ -11,7 +11,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
-    "ruff>=0.1.0",
+    "ruff>=0.14.1",
+    "ty>=0.0.1a16",
 ]
 
 [build-system]
@@ -25,5 +26,16 @@ python_functions = "test_*"
 addopts = "-v"
 
 [tool.ruff]
-line-length = 100
-target-version = "py311"
+line-length = 88
+extend-exclude = ["tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+extend-select = ["UP"]
+ignore = ["F722", "D203", "D213", "S101", "COM812", "T201"]
+
+[tool.ruff.lint.extend-per-file-ignores]
+"__init__.py" = ["E402", "F401", "F403", "E501"]
+
+[tool.ty.src]
+exclude = ["tests/*", "scripts/*"]
