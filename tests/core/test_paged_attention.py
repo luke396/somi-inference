@@ -102,3 +102,122 @@ class TestKVCache:
         # Verify copy
         assert torch.allclose(cache.key_cache[0], cache.key_cache[1])
         assert torch.allclose(cache.value_cache[0], cache.value_cache[1])
+
+
+class TestKVCacheManager:
+    """Test KVCacheManager functionality."""
+
+    def test_register_and_free_sequence(self):
+        """Test sequence registration and freeing."""
+        manager = KVCacheManager(
+            num_blocks=10,
+            block_size=8,
+            num_heads=4,
+            head_dim=16,
+            n_layers=2,
+        )
+
+        # Register sequence
+        manager.register_sequence(seq_id=0)
+        assert 0 in manager.seq_to_block
+        assert manager.get_num_tokens(0) == 0
+
+        # Free sequence
+        manager.free_sequence(seq_id=0)
+        assert 0 not in manager.seq_to_block
+
+    def test_allocate_slots(self):
+        """Test slot allocation."""
+        manager = KVCacheManager(
+            num_blocks=10,
+            block_size=4,  # Small block size for testing
+            num_heads=2,
+            head_dim=8,
+            n_layers=1,
+        )
+
+        manager.register_sequence(seq_id=0)
+
+        # Allocate 5 tokens (should use 2 blocks: 4 + 1)
+        manager.allocate_slots(seq_id=0, new_num_tokens=5)
+        block_ids = manager.get_block_ids(0)
+        assert len(block_ids) == 2
+
+    def test_fork_sequence(self):
+        """Test sequence forking with COW."""
+        manager = KVCacheManager(
+            num_blocks=10,
+            block_size=4,
+            num_heads=2,
+            head_dim=8,
+            n_layers=1,
+        )
+
+        # Setup source sequence
+        manager.register_sequence(seq_id=0)
+        manager.allocate_slots(seq_id=0, new_num_tokens=4)
+        manager.advance_tokens(seq_id=0, num_tokens=4)
+
+        # Fork sequence
+        manager.fork_sequence(src_seq_id=0, dst_seq_id=1)
+
+        # Verify fork
+        assert manager.get_block_ids(0) == manager.get_block_ids(1)
+        assert manager.get_num_tokens(0) == manager.get_num_tokens(1)
+
+        # Verify reference count increased
+        block_id = manager.get_block_ids(0)[0]
+        assert manager.allocator.ref_cnt[block_id] == 2
+
+    def test_copy_on_write(self):
+        """Test COW when writing to shared block."""
+        manager = KVCacheManager(
+            num_blocks=10,
+            block_size=4,
+            num_heads=2,
+            head_dim=8,
+            n_layers=1,
+        )
+
+        # Setup and fork with partial block
+        manager.register_sequence(seq_id=0)
+        manager.allocate_slots(seq_id=0, new_num_tokens=3)  # Partial block
+        manager.advance_tokens(seq_id=0, num_tokens=3)
+        manager.fork_sequence(src_seq_id=0, dst_seq_id=1)
+
+        original_block_id = manager.get_block_ids(1)[0]
+
+        # Allocate more slots for seq 1 (should trigger COW since slot > 0)
+        manager.allocate_slots(seq_id=1, new_num_tokens=1)
+
+        # Verify COW happened
+        new_block_id = manager.get_block_ids(1)[0]
+        assert new_block_id != original_block_id
+
+    def test_build_block_tables(self):
+        """Test block table construction."""
+        manager = KVCacheManager(
+            num_blocks=10,
+            block_size=4,
+            num_heads=2,
+            head_dim=8,
+            n_layers=1,
+        )
+
+        # Setup two sequences with different lengths
+        manager.register_sequence(seq_id=0)
+        manager.allocate_slots(seq_id=0, new_num_tokens=8)
+        manager.advance_tokens(seq_id=0, num_tokens=8)
+
+        manager.register_sequence(seq_id=1)
+        manager.allocate_slots(seq_id=1, new_num_tokens=4)
+        manager.advance_tokens(seq_id=1, num_tokens=4)
+
+        # Build block tables
+        block_tables, seq_lens = manager.build_block_tables([0, 1])
+
+        # Verify shapes
+        assert block_tables.shape == (2, 2)  # 2 seqs, max 2 blocks
+        assert seq_lens.shape == (2,)
+        assert seq_lens[0] == 8
+        assert seq_lens[1] == 4
