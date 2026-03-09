@@ -1,6 +1,9 @@
 """Model adapter base class for inference engine."""
+
 from typing import Protocol
+
 import torch
+
 from somi_inference.core.paged_attention import KVCacheManager
 
 
@@ -25,8 +28,9 @@ class ModelAdapter(Protocol):
 
         Returns:
             logits: Output logits, shape (1, prompt_len, vocab_size)
+
         """
-        raise NotImplementedError("Phase 1.2: Implement in QwenAdapter")
+        raise NotImplementedError
 
     def decode(
         self,
@@ -45,5 +49,6 @@ class ModelAdapter(Protocol):
 
         Returns:
             logits: Output logits, shape (batch_size, 1, vocab_size)
+
         """
-        raise NotImplementedError("Phase 1.2: Implement in QwenAdapter")
+        raise NotImplementedError

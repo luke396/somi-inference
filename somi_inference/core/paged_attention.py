@@ -57,7 +57,7 @@ class KVCache:
         head_dim: int,
     ) -> None:
         """Initialize the KV cache with pre-allocated space for keys and values."""
-        # TODO(Phase 1.2): Add num_kv_heads parameter for GQA support
+        # Phase 1.2: Add num_kv_heads parameter for GQA support
         # Currently assumes num_kv_heads == num_heads (MHA)
         # pre-allocate physical blocks' space
         self.key_cache = torch.zeros((num_blocks, block_size, num_heads, head_dim))
@@ -236,11 +236,7 @@ def paged_attention_decode(
     seq_lens: torch.Tensor,  # (num_seqs,)
 ) -> torch.Tensor:
     """Compute paged attention decode with online softmax over KV cache blocks."""
-    # TODO(Phase 1.2): Add GQA support
-    # When num_q_heads > num_kv_heads, need to repeat KV heads:
-    # repeat_factor = num_q_heads // num_kv_heads
-    # key_block = key_block.repeat_interleave(repeat_factor, dim=2)
-    # value_block = value_block.repeat_interleave(repeat_factor, dim=2)
+    # Phase 1.2: Add GQA support (repeat KV heads when num_q_heads > num_kv_heads)
     scale_factor = 1 / sqrt(q.shape[-1])
     seq_score_max = torch.full(
         (q.shape[0], q.shape[1]), -torch.inf, device=q.device
