@@ -16,8 +16,16 @@ dev = [
 ]
 
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+requires = ["uv_build>=0.8.3,<0.9.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "somi_inference"
+module-root = ""
+
+[tool.uv]
+package = true
+python-preference = "managed"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -32,10 +40,22 @@ extend-exclude = ["tests", "scripts"]
 [tool.ruff.lint]
 select = ["ALL"]
 extend-select = ["UP"]
-ignore = ["F722", "D203", "D213", "S101", "COM812", "T201"]
+ignore = [
+    "F722",   # forward-annotation-syntax-error (jaxtyping uses non-standard annotations)
+    "D203",   # incorrect-blank-line-before-class (conflicts with D211)
+    "D213",   # multi-line-summary-second-line (conflicts with D212)
+    "S101",   # assert (allow assert in non-test code)
+    "COM812", # missing-trailing-comma (conflicts with ruff formatter)
+    "T201",   # print (allow print statements)
+]
 
 [tool.ruff.lint.extend-per-file-ignores]
-"__init__.py" = ["E402", "F401", "F403", "E501"]
+"__init__.py" = [
+    "E402",  # module-import-not-at-top-of-file
+    "F401",  # unused-import (re-exports)
+    "F403",  # undefined-local-with-import-star
+    "E501",  # line-too-long
+]
 
 [tool.ty.src]
 exclude = ["tests/*", "scripts/*"]
