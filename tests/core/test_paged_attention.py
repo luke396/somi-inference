@@ -221,3 +221,60 @@ class TestKVCacheManager:
         assert seq_lens.shape == (2,)
         assert seq_lens[0] == 8
         assert seq_lens[1] == 4
+
+
+class TestPagedAttentionDecode:
+    """Test paged_attention_decode functionality."""
+
+    def test_output_shape(self, device, seed):
+        """Test output shape is correct."""
+        num_seqs = 2
+        num_heads = 4
+        head_dim = 16
+        num_blocks = 8
+        block_size = 4
+        max_blocks_per_seq = 3
+
+        # Create mock inputs
+        q = torch.randn(num_seqs, num_heads, head_dim)
+        key_cache = torch.randn(num_blocks, block_size, num_heads, head_dim)
+        value_cache = torch.randn(num_blocks, block_size, num_heads, head_dim)
+        block_tables = torch.randint(0, num_blocks, (num_seqs, max_blocks_per_seq))
+        seq_lens = torch.tensor([10, 6])
+
+        # Run paged attention
+        output = paged_attention_decode(q, key_cache, value_cache, block_tables, seq_lens)
+
+        # Verify shape
+        assert output.shape == (num_seqs, num_heads, head_dim)
+
+    def test_causal_masking(self, device, seed):
+        """Test that causal masking works (future tokens don't affect output)."""
+        num_heads = 2
+        head_dim = 8
+        num_blocks = 4
+        block_size = 4
+
+        # Single sequence
+        q = torch.randn(1, num_heads, head_dim)
+        key_cache = torch.randn(num_blocks, block_size, num_heads, head_dim)
+        value_cache = torch.randn(num_blocks, block_size, num_heads, head_dim)
+
+        # Sequence length 5 (only first 5 tokens should be attended)
+        block_tables = torch.tensor([[0, 1, 2, 3]])
+        seq_lens = torch.tensor([5])
+
+        output1 = paged_attention_decode(q, key_cache, value_cache, block_tables, seq_lens)
+
+        # Modify tokens beyond seq_len (should not affect output)
+        key_cache_modified = key_cache.clone()
+        value_cache_modified = value_cache.clone()
+        key_cache_modified[1, 2:] = torch.randn_like(key_cache_modified[1, 2:])
+        value_cache_modified[1, 2:] = torch.randn_like(value_cache_modified[1, 2:])
+
+        output2 = paged_attention_decode(
+            q, key_cache_modified, value_cache_modified, block_tables, seq_lens
+        )
+
+        # Outputs should be identical (future tokens masked)
+        assert torch.allclose(output1, output2, atol=1e-5)
