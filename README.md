@@ -15,13 +15,13 @@ Minimal LLM inference engine - from PyTorch to CUDA/Triton
 ## Installation
 
 ```bash
-pip install -e ".[dev]"
+uv sync
 ```
 
 ## Testing
 
 ```bash
-pytest tests/
+uv run pytest tests/
 ```
 
 ## Project Structure
