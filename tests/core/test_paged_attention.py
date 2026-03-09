@@ -58,3 +58,47 @@ class TestBlockAllocator:
         # Multiple references - COW needed
         allocator.increase_ref(block_id)
         assert allocator.need_cow(block_id)
+
+
+class TestKVCache:
+    """Test KVCache functionality."""
+
+    def test_write_and_read(self, device):
+        """Test writing and reading KV cache."""
+        num_blocks = 4
+        block_size = 8
+        num_heads = 4
+        head_dim = 16
+
+        cache = KVCache(
+            num_blocks=num_blocks,
+            block_size=block_size,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        )
+
+        # Write to cache
+        key = torch.randn(num_heads, head_dim)
+        value = torch.randn(num_heads, head_dim)
+        cache.write(block_id=0, slot=3, key=key, value=value)
+
+        # Verify write
+        assert torch.allclose(cache.key_cache[0, 3], key)
+        assert torch.allclose(cache.value_cache[0, 3], value)
+
+    def test_copy_block(self, device):
+        """Test block copying."""
+        cache = KVCache(num_blocks=4, block_size=8, num_heads=4, head_dim=16)
+
+        # Write to source block
+        for slot in range(8):
+            key = torch.randn(4, 16)
+            value = torch.randn(4, 16)
+            cache.write(block_id=0, slot=slot, key=key, value=value)
+
+        # Copy block
+        cache.copy_block(src_block_id=0, dst_block_id=1)
+
+        # Verify copy
+        assert torch.allclose(cache.key_cache[0], cache.key_cache[1])
+        assert torch.allclose(cache.value_cache[0], cache.value_cache[1])
