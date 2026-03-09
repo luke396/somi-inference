@@ -44,3 +44,4 @@ Thumbs.db
 
 # Internal planning documents
 docs/plans/
+.claude/
