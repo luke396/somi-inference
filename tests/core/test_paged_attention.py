@@ -73,7 +73,7 @@ class TestKVCache:
         cache = KVCache(
             num_blocks=num_blocks,
             block_size=block_size,
-            num_heads=num_heads,
+            num_kv_heads=num_heads,
             head_dim=head_dim,
         )
 
@@ -88,7 +88,7 @@ class TestKVCache:
 
     def test_copy_block(self, device):
         """Test block copying."""
-        cache = KVCache(num_blocks=4, block_size=8, num_heads=4, head_dim=16)
+        cache = KVCache(num_blocks=4, block_size=8, num_kv_heads=4, head_dim=16)
 
         # Write to source block
         for slot in range(8):
@@ -112,7 +112,7 @@ class TestKVCacheManager:
         manager = KVCacheManager(
             num_blocks=10,
             block_size=8,
-            num_heads=4,
+            num_kv_heads=4,
             head_dim=16,
             n_layers=2,
         )
@@ -131,7 +131,7 @@ class TestKVCacheManager:
         manager = KVCacheManager(
             num_blocks=10,
             block_size=4,  # Small block size for testing
-            num_heads=2,
+            num_kv_heads=2,
             head_dim=8,
             n_layers=1,
         )
@@ -148,7 +148,7 @@ class TestKVCacheManager:
         manager = KVCacheManager(
             num_blocks=10,
             block_size=4,
-            num_heads=2,
+            num_kv_heads=2,
             head_dim=8,
             n_layers=1,
         )
@@ -174,7 +174,7 @@ class TestKVCacheManager:
         manager = KVCacheManager(
             num_blocks=10,
             block_size=4,
-            num_heads=2,
+            num_kv_heads=2,
             head_dim=8,
             n_layers=1,
         )
@@ -199,7 +199,7 @@ class TestKVCacheManager:
         manager = KVCacheManager(
             num_blocks=10,
             block_size=4,
-            num_heads=2,
+            num_kv_heads=2,
             head_dim=8,
             n_layers=1,
         )
@@ -278,3 +278,63 @@ class TestPagedAttentionDecode:
 
         # Outputs should be identical (future tokens masked)
         assert torch.allclose(output1, output2, atol=1e-5)
+
+    def test_gqa_support(self, device, seed):
+        """Test GQA with num_q_heads > num_kv_heads (Qwen2.5-1.5B: 12:2 ratio)."""
+        num_seqs = 2
+        num_q_heads = 12
+        num_kv_heads = 2
+        head_dim = 128
+        num_blocks = 8
+        block_size = 16
+        max_blocks_per_seq = 3
+
+        # Create inputs with GQA configuration
+        q = torch.randn(num_seqs, num_q_heads, head_dim)
+        key_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_dim)
+        value_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_dim)
+        block_tables = torch.randint(0, num_blocks, (num_seqs, max_blocks_per_seq))
+        seq_lens = torch.tensor([20, 25])
+
+        # Run paged attention with GQA
+        output = paged_attention_decode(q, key_cache, value_cache, block_tables, seq_lens)
+
+        # Verify output shape
+        assert output.shape == (num_seqs, num_q_heads, head_dim)
+
+    def test_mha_backward_compatibility(self, device, seed):
+        """Test MHA (num_q_heads == num_kv_heads) still works correctly."""
+        num_seqs = 2
+        num_heads = 8
+        head_dim = 64
+        num_blocks = 4
+        block_size = 16
+
+        # MHA: same number of Q and KV heads
+        q = torch.randn(num_seqs, num_heads, head_dim)
+        key_cache = torch.randn(num_blocks, block_size, num_heads, head_dim)
+        value_cache = torch.randn(num_blocks, block_size, num_heads, head_dim)
+        block_tables = torch.randint(0, num_blocks, (num_seqs, 2))
+        seq_lens = torch.tensor([15, 20])
+
+        output = paged_attention_decode(q, key_cache, value_cache, block_tables, seq_lens)
+
+        assert output.shape == (num_seqs, num_heads, head_dim)
+
+    def test_gqa_invalid_ratio(self, device, seed):
+        """Test that invalid GQA ratio raises assertion error."""
+        num_seqs = 1
+        num_q_heads = 7  # Not divisible by num_kv_heads
+        num_kv_heads = 2
+        head_dim = 64
+        num_blocks = 4
+        block_size = 8
+
+        q = torch.randn(num_seqs, num_q_heads, head_dim)
+        key_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_dim)
+        value_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_dim)
+        block_tables = torch.tensor([[0, 1]])
+        seq_lens = torch.tensor([10])
+
+        with pytest.raises(AssertionError, match="num_q_heads must be divisible by num_kv_heads"):
+            paged_attention_decode(q, key_cache, value_cache, block_tables, seq_lens)

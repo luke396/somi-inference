@@ -53,17 +53,14 @@ class KVCache:
         self,
         num_blocks: int,
         block_size: int,
-        num_heads: int,
+        num_kv_heads: int,
         head_dim: int,
     ) -> None:
         """Initialize the KV cache with pre-allocated space for keys and values."""
-        # Phase 1.2: Add num_kv_heads parameter for GQA support
-        # Currently assumes num_kv_heads == num_heads (MHA)
-        # pre-allocate physical blocks' space
-        self.key_cache = torch.zeros((num_blocks, block_size, num_heads, head_dim))
-        self.value_cache = torch.zeros((num_blocks, block_size, num_heads, head_dim))
+        self.key_cache = torch.zeros((num_blocks, block_size, num_kv_heads, head_dim))
+        self.value_cache = torch.zeros((num_blocks, block_size, num_kv_heads, head_dim))
 
-        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
 
     def write(
@@ -74,8 +71,9 @@ class KVCache:
         Writes to the specified block and slot.
         The layout of key and value should be (num_heads, head_dim) for a single token.
         """
-        assert key.shape == (value.shape) == (self.num_heads, self.head_dim), (
-            "Key and value tensors must have shape (num_heads, head_dim)"
+        assert key.shape == (value.shape) == (self.num_kv_heads, self.head_dim), (
+            f"Key and value tensors must have shape "
+            f"({self.num_kv_heads}, {self.head_dim})"
         )
         self.key_cache[block_id, slot] = key
         self.value_cache[block_id, slot] = value
@@ -93,7 +91,7 @@ class KVCacheManager:
         self,
         num_blocks: int,
         block_size: int,
-        num_heads: int,
+        num_kv_heads: int,
         head_dim: int,
         n_layers: int = 1,
     ) -> None:
@@ -106,7 +104,7 @@ class KVCacheManager:
             KVCache(
                 num_blocks=num_blocks,
                 block_size=block_size,
-                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
                 head_dim=head_dim,
             )
             for _ in range(self.n_layers)
@@ -229,14 +227,27 @@ class KVCacheManager:
 
 
 def paged_attention_decode(
-    q: torch.Tensor,  # (num_seqs, num_heads, head_dim)
-    key_cache: torch.Tensor,  # (num_blocks, block_size, num_heads, head_dim)
-    value_cache: torch.Tensor,  # (num_blocks, block_size, num_heads, head_dim)
+    q: torch.Tensor,  # (num_seqs, num_q_heads, head_dim)
+    key_cache: torch.Tensor,  # (num_blocks, block_size, num_kv_heads, head_dim)
+    value_cache: torch.Tensor,  # (num_blocks, block_size, num_kv_heads, head_dim)
     block_tables: torch.Tensor,  # (num_seqs, max_blocks_per_seq)
     seq_lens: torch.Tensor,  # (num_seqs,)
 ) -> torch.Tensor:
     """Compute paged attention decode with online softmax over KV cache blocks."""
-    # Phase 1.2: Add GQA support (repeat KV heads when num_q_heads > num_kv_heads)
+    num_q_heads = q.shape[1]
+    num_kv_heads = key_cache.shape[2]
+    # GQA:repeat KV heads to match Q heads
+    # Simply copy q_heads to match kv_heads, maybe some memory waste
+    if num_q_heads != num_kv_heads:
+        assert num_q_heads % num_kv_heads == 0, (
+            "num_q_heads must be divisible by num_kv_heads for GQA"
+        )
+        repeat_factor = num_q_heads // num_kv_heads
+        # from (num_blocks, block_size, num_kv_heads, head_dim)
+        # to (..., num_q_heads, ...)
+        key_cache = key_cache.repeat_interleave(repeat_factor, dim=2)
+        value_cache = value_cache.repeat_interleave(repeat_factor, dim=2)
+
     scale_factor = 1 / sqrt(q.shape[-1])
     seq_score_max = torch.full(
         (q.shape[0], q.shape[1]), -torch.inf, device=q.device
