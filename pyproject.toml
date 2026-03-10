@@ -5,6 +5,7 @@ description = "Minimal LLM inference engine"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "numpy>=2.4.3",
     "torch>=2.0.0",
 ]
 
@@ -47,6 +48,7 @@ ignore = [
     "S101",   # assert (allow assert in non-test code)
     "COM812", # missing-trailing-comma (conflicts with ruff formatter)
     "T201",   # print (allow print statements)
+    "ERA001"  # commented out code (allow commented out code in some cases)
 ]
 
 [tool.ruff.lint.extend-per-file-ignores]
