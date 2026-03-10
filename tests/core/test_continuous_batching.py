@@ -1,7 +1,10 @@
 """Tests for continuous batching components."""
-import pytest
+
 import torch
 from collections import deque
+
+import pytest
+
 from somi_inference.core.continuous_batching import (
     SequenceStatus,
     Sequence,
@@ -9,28 +12,62 @@ from somi_inference.core.continuous_batching import (
     ContinuousBatchingEngine,
 )
 from somi_inference.core.paged_attention import KVCacheManager
-from somi_inference.models.base import ModelAdapter
 
 
 class MockModelAdapter:
     """Mock model adapter for testing."""
 
-    def __init__(self, vocab_size=100):
+    def __init__(self, vocab_size=100, return_token=None):
         self.vocab_size = vocab_size
+        self.return_token = return_token  # If set, always return this token
         self.prefill_calls = []
         self.decode_calls = []
 
     def prefill(self, prompt_tokens, kv_manager, seq_id):
-        """Mock prefill - return random logits."""
+        """Mock prefill - return logits that produce a specific token."""
         self.prefill_calls.append((prompt_tokens, seq_id))
         batch_size, seq_len = prompt_tokens.shape
-        return torch.randn(batch_size, seq_len, self.vocab_size)
+        logits = torch.randn(batch_size, seq_len, self.vocab_size)
+
+        # If return_token is set, make sure argmax returns that token
+        if self.return_token is not None:
+            logits[:, :, self.return_token] = 100.0
+
+        return logits
 
     def decode(self, input_ids, kv_manager, seq_ids, positions):
-        """Mock decode - return random logits."""
+        """Mock decode - return logits that produce a specific token."""
         self.decode_calls.append((input_ids, seq_ids))
         batch_size = input_ids.shape[0]
-        return torch.randn(batch_size, 1, self.vocab_size)
+        logits = torch.randn(batch_size, 1, self.vocab_size)
+
+        # If return_token is set, make sure argmax returns that token
+        if self.return_token is not None:
+            logits[:, :, self.return_token] = 100.0
+
+        return logits
+
+
+@pytest.fixture
+def kv_manager():
+    """Create a KVCacheManager for testing."""
+    return KVCacheManager(
+        num_blocks=10,
+        block_size=4,
+        num_kv_heads=2,
+        head_dim=8,
+        n_layers=1,
+    )
+
+
+@pytest.fixture
+def scheduler(kv_manager):
+    """Create a Scheduler for testing."""
+    return Scheduler(
+        max_concurrent=2,
+        block_size=4,
+        free_block_num_fn=kv_manager.allocator.num_free_blocks,
+    )
 
 
 class TestScheduler:
@@ -169,21 +206,10 @@ class TestScheduler:
 class TestContinuousBatchingEngine:
     """Test ContinuousBatchingEngine functionality."""
 
-    def test_single_sequence_prefill_decode(self):
+    def test_single_sequence_prefill_decode(self, kv_manager, scheduler):
         """Test single sequence prefill and decode."""
-        kv_manager = KVCacheManager(
-            num_blocks=10,
-            block_size=4,
-            num_heads=2,
-            head_dim=8,
-            n_layers=1,
-        )
-        scheduler = Scheduler(
-            max_concurrent=2,
-            block_size=4,
-            free_block_num_fn=kv_manager.allocator.num_free_blocks,
-        )
-        model = MockModelAdapter(vocab_size=100)
+        # Use return_token=5 to avoid EOS token (2)
+        model = MockModelAdapter(vocab_size=100, return_token=5)
         engine = ContinuousBatchingEngine(
             model=model,
             kv_manager=kv_manager,
@@ -208,39 +234,14 @@ class TestContinuousBatchingEngine:
         assert len(finished) == 1
         assert finished[0].seq_id == 0
         assert len(finished[0].output_tokens) == 3
+        assert all(token == 5 for token in finished[0].output_tokens)
         assert len(model.prefill_calls) == 1
         assert len(model.decode_calls) >= 2  # At least 2 decode steps
 
-    def test_eos_token_handling(self):
+    def test_eos_token_handling(self, kv_manager, scheduler):
         """Test early stopping on EOS token."""
-        kv_manager = KVCacheManager(
-            num_blocks=10,
-            block_size=4,
-            num_heads=2,
-            head_dim=8,
-            n_layers=1,
-        )
-        scheduler = Scheduler(
-            max_concurrent=2,
-            block_size=4,
-            free_block_num_fn=kv_manager.allocator.num_free_blocks,
-        )
-
-        # Mock adapter that always returns EOS token
-        class EOSAdapter(MockModelAdapter):
-            def prefill(self, prompt_tokens, kv_manager, seq_id):
-                batch_size, seq_len = prompt_tokens.shape
-                logits = torch.zeros(batch_size, seq_len, self.vocab_size)
-                logits[:, :, 2] = 100.0  # EOS token has highest logit
-                return logits
-
-            def decode(self, input_ids, kv_manager, seq_ids, positions):
-                batch_size = input_ids.shape[0]
-                logits = torch.zeros(batch_size, 1, self.vocab_size)
-                logits[:, :, 2] = 100.0
-                return logits
-
-        model = EOSAdapter(vocab_size=100)
+        # Use return_token=2 to always return EOS token
+        model = MockModelAdapter(vocab_size=100, return_token=2)
         engine = ContinuousBatchingEngine(
             model=model,
             kv_manager=kv_manager,
