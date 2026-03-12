@@ -23,10 +23,10 @@ class MockModelAdapter:
         self.prefill_calls = []
         self.decode_calls = []
 
-    def prefill(self, prompt_tokens, kv_manager, seq_id):
+    def prefill(self, input_ids, kv_manager, seq_id):
         """Mock prefill - return logits that produce a specific token."""
-        self.prefill_calls.append((prompt_tokens, seq_id))
-        batch_size, seq_len = prompt_tokens.shape
+        self.prefill_calls.append((input_ids, seq_id))
+        batch_size, seq_len = input_ids.shape
         logits = torch.randn(batch_size, seq_len, self.vocab_size)
 
         # If return_token is set, make sure argmax returns that token
@@ -35,7 +35,7 @@ class MockModelAdapter:
 
         return logits
 
-    def decode(self, input_ids, kv_manager, seq_ids, positions):
+    def decode(self, input_ids, kv_manager, seq_ids):
         """Mock decode - return logits that produce a specific token."""
         self.decode_calls.append((input_ids, seq_ids))
         batch_size = input_ids.shape[0]

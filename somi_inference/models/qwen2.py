@@ -1,7 +1,30 @@
 """Qwen 2.5 base components: RMSNorm, RotaryEmbedding, causal_attention."""
 
+from collections.abc import Callable
+from dataclasses import dataclass
+from enum import Enum, auto
+
 import torch
 from torch import nn
+
+
+class ForwardMode(Enum):
+    """Distinguish between prefill and decode modes for attention behavior."""
+
+    PREFILL = auto()  # SGLang's EXTEND
+    DECODE = auto()  # SGLang's DECODE
+
+
+@dataclass
+class ForwardContext:
+    """Per-forward-pass context, constructed by Adapter."""
+
+    mode: ForwardMode
+    # layer_idx is needed for kv_cache manager
+    attn_fn: Callable[
+        [torch.Tensor, torch.Tensor, torch.Tensor, int], torch.Tensor
+    ]  # (q, k, v, layer_idx) -> attn_output
+    posi_idx: torch.Tensor
 
 
 class RMSNorm(nn.Module):
@@ -129,11 +152,13 @@ class QwenAttention(nn.Module):
         num_attention_heads: int,
         num_key_value_heads: int,
         head_dim: int,
+        layer_idx: int,
         sliding_window_size: int = 0,
     ) -> None:
         """Initialize Q/K/V/O projections for grouped-query attention."""
         super().__init__()
         self.head_dim = head_dim
+        self.layer_idx = layer_idx
         self.q_proj = nn.Linear(hidden_size, num_attention_heads * head_dim, bias=True)
         self.k_proj = nn.Linear(hidden_size, num_key_value_heads * head_dim, bias=True)
         self.v_proj = nn.Linear(hidden_size, num_key_value_heads * head_dim, bias=True)
@@ -142,22 +167,26 @@ class QwenAttention(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor,  # [batch_size, seq_len, hidden_size]
         cos: torch.Tensor,
         sin: torch.Tensor,
+        ctx: ForwardContext,
     ) -> torch.Tensor:
-        """Project, apply RoPE, compute causal attention, and project output."""
+        """Project, apply RoPE, delegate to attn_fn, and project output."""
+        batch, seq_len = hidden_states.shape[:2]
+        q, k, v = self._project_qkv(hidden_states, cos, sin)
+        attn_output = ctx.attn_fn(q, k, v, self.layer_idx)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch, seq_len, -1)
+        return self.o_proj(attn_output)
+
+    def _project_qkv(self, hidden_states, cos, sin):
         batch, seq_len = hidden_states.shape[:2]
         reshape = (batch, seq_len, -1, self.head_dim)
-
         q = self.q_proj(hidden_states).view(reshape).transpose(1, 2)
         k = self.k_proj(hidden_states).view(reshape).transpose(1, 2)
         v = self.v_proj(hidden_states).view(reshape).transpose(1, 2)
-
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
-        attn_output = causal_attention(q, k, v)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch, seq_len, -1)
-        return self.o_proj(attn_output)
+        return q, k, v  # [batch, num_heads, seq_len, head_dim]
 
 
 class QwenDecoderLayer(nn.Module):
@@ -170,15 +199,13 @@ class QwenDecoderLayer(nn.Module):
         num_attention_heads: int,
         num_key_value_heads: int,
         head_dim: int,
+        layer_idx: int,
         rms_norm_eps: float = 1e-6,
     ) -> None:
         """Initialize attention, MLP, and layer norms."""
         super().__init__()
         self.self_attn = QwenAttention(
-            hidden_size,
-            num_attention_heads,
-            num_key_value_heads,
-            head_dim,
+            hidden_size, num_attention_heads, num_key_value_heads, head_dim, layer_idx
         )
         self.mlp = QwenMLP(hidden_size, intermediate_size)
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
@@ -189,17 +216,16 @@ class QwenDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
+        ctx: ForwardContext,
     ) -> torch.Tensor:
         """Apply pre-norm attention and pre-norm MLP with residual connections."""
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, cos, sin)
-        hidden_states = residual + hidden_states
+        hidden_states = residual + self.self_attn(hidden_states, cos, sin, ctx)
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        return residual + hidden_states
+        return residual + self.mlp(hidden_states)
 
 
 class QwenModel(nn.Module):
@@ -232,19 +258,18 @@ class QwenModel(nn.Module):
                     num_attention_heads=num_attention_heads,
                     num_key_value_heads=num_key_value_heads,
                     head_dim=head_dim,
+                    layer_idx=idx,
                     rms_norm_eps=rms_norm_eps,
                 )
-                for _ in range(num_hidden_layers)
+                for idx in range(num_hidden_layers)
             ]
         )
         self.final_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, ctx: ForwardContext) -> torch.Tensor:
         """Run input_ids through embedding, all decoder layers, and final norm."""
         hidden_states = self.token_embedding(input_ids)
-        seq_len = input_ids.shape[1]
-        posi_idx = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
-        cos, sin = self.positional_embedding(posi_idx)
+        cos, sin = self.positional_embedding(ctx.posi_idx)
         for layer in self.layers:
-            hidden_states = layer(hidden_states, cos, sin)
+            hidden_states = layer(hidden_states, cos, sin, ctx)
         return self.final_layernorm(hidden_states)

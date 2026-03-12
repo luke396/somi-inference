@@ -140,12 +140,8 @@ class ContinuousBatchingEngine:
         )  # (batch_size, 1)
         seq_ids = [seq.seq_id for seq in seqs]
 
-        pos = torch.tensor(
-            [len(seq.prompt_tokens) + len(seq.output_tokens) - 1 for seq in seqs]
-        ).unsqueeze(1)  # (batch_size, 1)
-
         logits = self.model.decode(
-            input_ids, self.kv_manager, seq_ids, pos
+            input_ids, self.kv_manager, seq_ids
         )  # (batch_size, 1, vocab_size)
         tokens = torch.argmax(logits[:, 0, :], dim=-1)  # (batch_size,)
         for i, seq in enumerate(seqs):

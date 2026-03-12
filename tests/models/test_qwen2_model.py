@@ -1,7 +1,12 @@
 """Tests for QwenModel."""
 
 import torch
-from somi_inference.models.qwen2 import QwenModel
+from somi_inference.models.qwen2 import (
+    ForwardContext,
+    ForwardMode,
+    QwenModel,
+    causal_attention,
+)
 
 # Shared small-model config for tests
 SMALL_CONFIG = dict(
@@ -15,13 +20,22 @@ SMALL_CONFIG = dict(
 )
 
 
+def _make_ctx(seq_len: int, batch: int = 1):
+    """Create a ForwardContext for prefill with causal attention."""
+    return ForwardContext(
+        mode=ForwardMode.PREFILL,
+        attn_fn=lambda q, k, v, layer_idx: causal_attention(q, k, v),
+        posi_idx=torch.arange(seq_len).unsqueeze(0).expand(batch, -1),
+    )
+
+
 class TestQwenModel:
     def test_forward_shape(self):
         """Output shape should be (batch, seq_len, hidden_size)."""
         model = QwenModel(**SMALL_CONFIG, num_hidden_layers=2)
 
         input_ids = torch.randint(0, 100, (2, 10))
-        out = model(input_ids)
+        out = model(input_ids, _make_ctx(seq_len=10, batch=2))
         assert out.shape == (2, 10, 64)
 
     def test_embedding_lookup(self):
@@ -29,7 +43,7 @@ class TestQwenModel:
         model = QwenModel(**SMALL_CONFIG, num_hidden_layers=1)
 
         input_ids = torch.tensor([[0, 1, 2]])
-        out = model(input_ids)
+        out = model(input_ids, _make_ctx(seq_len=3))
 
         assert not torch.allclose(out[0, 0], out[0, 1])
         assert not torch.allclose(out[0, 1], out[0, 2])
@@ -43,8 +57,9 @@ class TestQwenModel:
         model_2layer = QwenModel(**SMALL_CONFIG, num_hidden_layers=2)
 
         input_ids = torch.randint(0, 100, (1, 10))
-        out_1layer = model_1layer(input_ids)
-        out_2layer = model_2layer(input_ids)
+        ctx = _make_ctx(seq_len=10)
+        out_1layer = model_1layer(input_ids, ctx)
+        out_2layer = model_2layer(input_ids, ctx)
 
         assert not torch.allclose(out_1layer, out_2layer, atol=0.1)
 
@@ -54,8 +69,8 @@ class TestQwenModel:
         model = QwenModel(**SMALL_CONFIG, num_hidden_layers=1)
 
         # Same token at different absolute positions should produce different outputs
-        out1 = model(torch.tensor([[5]]))       # token 5 at position 0
-        out2 = model(torch.tensor([[7, 5]]))    # token 5 at position 1
+        out1 = model(torch.tensor([[5]]), _make_ctx(seq_len=1))
+        out2 = model(torch.tensor([[7, 5]]), _make_ctx(seq_len=2))
 
         assert not torch.allclose(out1[0, 0], out2[0, 1], atol=0.01)
 
@@ -64,7 +79,7 @@ class TestQwenModel:
         model = QwenModel(**SMALL_CONFIG, num_hidden_layers=2)
 
         input_ids = torch.randint(0, 100, (1, 8))
-        out = model(input_ids)
+        out = model(input_ids, _make_ctx(seq_len=8))
         out.sum().backward()
 
         assert model.token_embedding.weight.grad is not None
@@ -88,5 +103,5 @@ class TestQwenModel:
         )
 
         input_ids = torch.randint(0, 500, (2, 16))
-        out = model(input_ids)
+        out = model(input_ids, _make_ctx(seq_len=16, batch=2))
         assert out.shape == (2, 16, 384)
