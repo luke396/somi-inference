@@ -13,6 +13,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
     "ruff>=0.14.1",
     "ty>=0.0.1a16",
 ]
@@ -31,9 +32,21 @@ python-preference = "managed"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-python_files = "test_*.py"
-python_functions = "test_*"
-addopts = "-v"
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--tb=short",
+    "--cov=somi_inference",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+]
 
 [tool.ruff]
 line-length = 88
