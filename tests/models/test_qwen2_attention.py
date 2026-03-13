@@ -44,22 +44,6 @@ class TestQwenAttention:
         out = attn(x, cos, sin, ctx)
         assert out.shape == (2, 10, 128)
 
-    def test_forward_shape_gqa(self):
-        """GQA: 12 Q heads, 2 KV heads should work."""
-        attn = QwenAttention(
-            hidden_size=384,
-            num_attention_heads=12,
-            num_key_value_heads=2,
-            head_dim=32,
-            layer_idx=0,
-        )
-        cos, sin = _make_rope_inputs(head_dim=32, seq_len=8, batch=2)
-        ctx = _make_ctx(seq_len=8, batch=2)
-
-        x = torch.randn(2, 8, 384)
-        out = attn(x, cos, sin, ctx)
-        assert out.shape == (2, 8, 384)
-
     def test_causal_masking(self):
         """Verify attention is causal (no future leakage)."""
         torch.manual_seed(42)

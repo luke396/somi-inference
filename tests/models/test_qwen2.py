@@ -34,12 +34,17 @@ class TestRMSNorm:
         expected = torch.tensor([[[2 / rms, 4 / rms, 6 / rms, 8 / rms]]])
         torch.testing.assert_close(out, expected)
 
-    def test_output_shape(self):
+    @pytest.mark.parametrize("batch,seq_len,hidden_size", [
+        (1, 1, 4),
+        (2, 10, 64),
+        (4, 20, 128),
+    ])
+    def test_output_shape(self, batch, seq_len, hidden_size):
         """Output shape should match input shape."""
-        norm = RMSNorm(hidden_size=64)
-        x = torch.randn(2, 10, 64)
+        norm = RMSNorm(hidden_size=hidden_size)
+        x = torch.randn(batch, seq_len, hidden_size)
         out = norm(x)
-        assert out.shape == (2, 10, 64)
+        assert out.shape == (batch, seq_len, hidden_size)
 
     def test_dtype_preserved(self):
         """Output dtype should match input dtype."""
@@ -219,3 +224,20 @@ class TestCausalAttention:
         out = causal_attention(q, k, v)
         # With seq_len=1, output = v (softmax of single element = 1.0)
         torch.testing.assert_close(out, v)
+
+
+@pytest.mark.parametrize("num_q_heads,num_kv_heads", [
+    (4, 4),   # MHA
+    (12, 2),  # GQA (Qwen2.5-1.5B ratio)
+    (8, 1),   # Extreme GQA
+])
+class TestCausalAttentionHeadConfigs:
+    def test_head_configuration(self, num_q_heads, num_kv_heads):
+        """Test various Q/KV head configurations."""
+        torch.manual_seed(42)
+        batch, seq_len, head_dim = 2, 8, 64
+        q = torch.randn(batch, num_q_heads, seq_len, head_dim)
+        k = torch.randn(batch, num_kv_heads, seq_len, head_dim)
+        v = torch.randn(batch, num_kv_heads, seq_len, head_dim)
+        out = causal_attention(q, k, v)
+        assert out.shape == (batch, num_q_heads, seq_len, head_dim)

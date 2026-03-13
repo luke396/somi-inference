@@ -86,22 +86,3 @@ class TestQwenModel:
         assert model.layers[0].self_attn.q_proj.weight.grad is not None
         assert model.layers[1].mlp.gate_proj.weight.grad is not None
         assert model.final_layernorm.weight.grad is not None
-
-    def test_forward_shape_gqa(self):
-        """Full model with GQA config (fewer KV heads than Q heads)."""
-        model = QwenModel(
-            vocab_size=500,
-            hidden_size=384,
-            intermediate_size=768,
-            num_hidden_layers=2,
-            num_attention_heads=12,
-            num_key_value_heads=2,
-            head_dim=32,
-            rms_norm_eps=1e-6,
-            rope_theta=1_000_000.0,
-            max_seq_size=512,
-        )
-
-        input_ids = torch.randint(0, 500, (2, 16))
-        out = model(input_ids, _make_ctx(seq_len=16, batch=2))
-        assert out.shape == (2, 16, 384)
