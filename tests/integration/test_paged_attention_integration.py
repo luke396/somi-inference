@@ -36,6 +36,7 @@ def kv_manager():
     )
 
 
+@pytest.mark.integration
 class TestPagedAttentionIntegration:
     def test_prefill_then_decode_uses_paged_attention(self, small_adapter, kv_manager):
         """Verify decode mode uses paged attention correctly."""
