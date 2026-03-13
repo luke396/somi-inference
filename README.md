@@ -1,12 +1,15 @@
 # somi-inference
 
-Minimal LLM inference engine - from PyTorch to CUDA/Triton
+Minimal LLM inference engine — from PyTorch to CUDA/Triton
+
+## Current Status
+
+Phase 1: PyTorch Baseline for Qwen2.5 (branch: `phase-1`)
+- [x] Phase 1.1: Paged attention + continuous batching
+- [x] Phase 1.2: Qwen2.5 support (GQA, ForwardContext, HF weight loading, e2e greedy decode)
+- Currently supports Qwen2.5-0.5B and 1.5B
 
 ## Roadmap
-
-### Phase 1: PyTorch Baseline
-- [x] Phase 1.1: Migrate paged attention + continuous batching
-- [ ] Phase 1.2: Qwen2.5-1.5B support with GQA
 
 ### Phase 2: CUDA/Triton Optimization
 - [ ] FlashAttention kernel
@@ -28,27 +31,11 @@ uv run pytest tests/
 
 ```
 somi_inference/
-├── core/              # Core inference algorithms
-│   ├── paged_attention.py
-│   └── continuous_batching.py
-└── models/            # Model adapters
-    └── base.py
+├── core/
+│   ├── paged_attention.py     # Paged attention with online softmax, GQA
+│   └── continuous_batching.py # Scheduler + batching engine
+└── models/
+    ├── base.py                # ModelAdapter protocol
+    ├── qwen2.py               # RMSNorm, RotaryEmbedding, Attention, MLP, DecoderLayer, Model
+    └── qwen2_adapter.py       # QwenAdapter (prefill/decode) + HF weight loading
 ```
-
-## Current Status
-
-Phase 1.1 complete - core inference algorithms migrated:
-- BlockAllocator: Physical block allocator (ref counting + COW)
-- KVCache: KV tensor storage
-- KVCacheManager: Coordinates allocator and cache
-- paged_attention_decode: Paged attention with online softmax
-- Scheduler: FCFS scheduler
-- ContinuousBatchingEngine: Inference engine
-- ModelAdapter: Abstract interface (QwenAdapter in Phase 1.2)
-
-## Next Steps (Phase 1.2)
-
-1. Implement QwenAdapter for HuggingFace Qwen2.5-1.5B
-2. Modify KVCache and paged_attention_decode for GQA support
-3. Implement end-to-end inference loop
-4. Verify output correctness

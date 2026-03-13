@@ -5,6 +5,14 @@ A minimal, self-contained LLM inference framework — focused on implementing th
 ## Environment
 
 - Use `uv` for dependency and environment management
+- Run tests: `uv run pytest`
+- Lint: `uv run ruff check`, type check: `uv run ty check`
+
+## Architecture
+
+- Design follows vLLM/SGLang patterns (ForwardContext, unified forward signature)
+- Model adapter pattern: `ModelAdapter` protocol in `models/base.py`, concrete adapters (e.g. `QwenAdapter`) handle prefill/decode
+- Core components: paged attention, KV cache management, continuous batching
 
 ## Documentation
 
