@@ -2,6 +2,7 @@
 import pytest
 import torch
 
+from somi_inference.core.paged_attention import KVCacheManager
 from somi_inference.models.qwen2 import (
     ForwardContext,
     ForwardMode,
@@ -75,6 +76,28 @@ def make_forward_context():
             mode=mode,
             attn_fn=lambda q, k, v, layer_idx: causal_attention(q, k, v),
             posi_idx=torch.arange(seq_len).unsqueeze(0).expand(batch, -1),
+        )
+
+    return _make
+
+
+@pytest.fixture
+def make_kv_manager():
+    """Factory for creating KVCacheManager with default config."""
+
+    def _make(
+        num_blocks=20,
+        block_size=4,
+        num_kv_heads=2,
+        head_dim=16,
+        n_layers=2,
+    ):
+        return KVCacheManager(
+            num_blocks=num_blocks,
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            n_layers=n_layers,
         )
 
     return _make
