@@ -1,34 +1,11 @@
 """Tests for QwenAttention."""
 
 import torch
-from somi_inference.models.qwen2 import (
-    ForwardContext,
-    ForwardMode,
-    QwenAttention,
-    RotaryEmbedding,
-    causal_attention,
-)
-
-
-def _make_rope_inputs(head_dim: int, seq_len: int, batch: int = 1):
-    """Create RotaryEmbedding and compute cos/sin for given sequence length."""
-    rope = RotaryEmbedding(hid_dim=head_dim, max_seq_len=512)
-    posi_idx = torch.arange(seq_len).unsqueeze(0).expand(batch, -1)
-    cos, sin = rope(posi_idx)
-    return cos, sin
-
-
-def _make_ctx(seq_len: int, batch: int = 1):
-    """Create a ForwardContext for prefill with causal attention."""
-    return ForwardContext(
-        mode=ForwardMode.PREFILL,
-        attn_fn=lambda q, k, v, layer_idx: causal_attention(q, k, v),
-        posi_idx=torch.arange(seq_len).unsqueeze(0).expand(batch, -1),
-    )
+from somi_inference.models.qwen2 import QwenAttention
 
 
 class TestQwenAttention:
-    def test_forward_shape_mha(self):
+    def test_forward_shape_mha(self, make_rope_inputs, make_forward_context):
         """Output shape should match input for MHA."""
         attn = QwenAttention(
             hidden_size=128,
@@ -37,14 +14,14 @@ class TestQwenAttention:
             head_dim=32,
             layer_idx=0,
         )
-        cos, sin = _make_rope_inputs(head_dim=32, seq_len=10, batch=2)
-        ctx = _make_ctx(seq_len=10, batch=2)
+        cos, sin = make_rope_inputs(head_dim=32, seq_len=10, batch=2)
+        ctx = make_forward_context(seq_len=10, batch=2)
 
         x = torch.randn(2, 10, 128)
         out = attn(x, cos, sin, ctx)
         assert out.shape == (2, 10, 128)
 
-    def test_causal_masking(self):
+    def test_causal_masking(self, make_rope_inputs, make_forward_context):
         """Verify attention is causal (no future leakage)."""
         torch.manual_seed(42)
         attn = QwenAttention(
@@ -54,8 +31,8 @@ class TestQwenAttention:
             head_dim=32,
             layer_idx=0,
         )
-        cos, sin = _make_rope_inputs(head_dim=32, seq_len=4)
-        ctx = _make_ctx(seq_len=4)
+        cos, sin = make_rope_inputs(head_dim=32, seq_len=4)
+        ctx = make_forward_context(seq_len=4)
 
         x = torch.randn(1, 4, 64)
         out = attn(x, cos, sin, ctx)
@@ -67,7 +44,7 @@ class TestQwenAttention:
 
         torch.testing.assert_close(out[0, 0], out_modified[0, 0], atol=1e-5, rtol=1e-5)
 
-    def test_project_qkv_shapes(self):
+    def test_project_qkv_shapes(self, make_rope_inputs):
         """project_qkv returns (q, k, v) with correct shapes."""
         attn = QwenAttention(
             hidden_size=64,
@@ -76,7 +53,7 @@ class TestQwenAttention:
             head_dim=16,
             layer_idx=0,
         )
-        cos, sin = _make_rope_inputs(head_dim=16, seq_len=5, batch=2)
+        cos, sin = make_rope_inputs(head_dim=16, seq_len=5, batch=2)
 
         x = torch.randn(2, 5, 64)
         q, k, v = attn._project_qkv(x, cos, sin)
