@@ -1,7 +1,11 @@
 """Qwen2.5 model adapter: bridges QwenModel with the inference engine."""
 
+from __future__ import annotations
+
+from collections.abc import Callable
+
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as F  # noqa: N812
 
 from somi_inference.core.paged_attention import KVCacheManager, paged_attention_decode
 from somi_inference.models.qwen2 import (
@@ -11,9 +15,15 @@ from somi_inference.models.qwen2 import (
     causal_attention,
 )
 
+# Type alias for attention function signature
+AttnFn = Callable[[torch.Tensor, torch.Tensor, torch.Tensor, int], torch.Tensor]
+
 
 class QwenAdapter:
-    def __init__(self, model: QwenModel):
+    """Adapter bridging QwenModel with KV cache management for inference."""
+
+    def __init__(self, model: QwenModel) -> None:
+        """Initialize adapter with a QwenModel instance."""
         self.model = model
 
     def _lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -26,14 +36,15 @@ class QwenAdapter:
         kv_manager: KVCacheManager,
         seq_id: int,
     ) -> torch.Tensor:
+        """Prefill a single sequence: write KV cache and return logits."""
 
-        def _make_prefill_attn(seq_id: int, kv_manager: KVCacheManager):
+        def _make_prefill_attn(seq_id: int, kv_manager: KVCacheManager) -> AttnFn:
             def attn_fn(
-                q,  # [batch_size=1, num_heads, seq_len, head_dim]
-                k,
-                v,
-                layer_idx,
-            ):
+                q: torch.Tensor,
+                k: torch.Tensor,
+                v: torch.Tensor,
+                layer_idx: int,
+            ) -> torch.Tensor:
                 k_write = k.squeeze(0).transpose(0, 1)  # (seq_len, num_heads, head_dim)
                 v_write = v.squeeze(0).transpose(0, 1)  # (seq_len, num_heads, head_dim)
                 kv_manager.write_kv(seq_id, layer_idx, k_write, v_write)
@@ -58,8 +69,15 @@ class QwenAdapter:
         kv_manager: KVCacheManager,
         seq_ids: list[int],
     ) -> torch.Tensor:
-        def _make_decode_attn(seq_ids: list[int], kv_manager: KVCacheManager):
-            def attn_fn(q, k, v, layer_idx):
+        """Decode one token per sequence using paged KV cache attention."""
+
+        def _make_decode_attn(seq_ids: list[int], kv_manager: KVCacheManager) -> AttnFn:
+            def attn_fn(
+                q: torch.Tensor,
+                k: torch.Tensor,
+                v: torch.Tensor,
+                layer_idx: int,
+            ) -> torch.Tensor:
                 # q, k, v: (batch_size, num_heads, 1, head_dim)
                 for i, seq_id in enumerate(seq_ids):
                     k_write = k[i].squeeze(1)  # (num_heads, head_dim)
@@ -133,8 +151,9 @@ def load_from_hf(model_name: str) -> QwenAdapter:
 
     Returns:
         QwenAdapter with loaded weights
+
     """
-    from transformers import AutoConfig, AutoModelForCausalLM
+    from transformers import AutoConfig, AutoModelForCausalLM  # noqa: PLC0415
 
     # Load HF config
     hf_config = AutoConfig.from_pretrained(model_name)
@@ -174,6 +193,6 @@ def load_from_hf(model_name: str) -> QwenAdapter:
 
     # Load into somi model
     somi_model.load_state_dict(somi_state_dict, strict=True)
-    somi_model.requires_grad_(False)
+    somi_model.requires_grad_(requires_grad=False)
 
     return QwenAdapter(somi_model)

@@ -49,7 +49,8 @@ ignore = [
     "S101",   # assert (allow assert in non-test code)
     "COM812", # missing-trailing-comma (conflicts with ruff formatter)
     "T201",   # print (allow print statements)
-    "ERA001"  # commented out code (allow commented out code in some cases)
+    "ERA001", # commented out code (allow commented out code in some cases)
+    "PLR0913", # too-many-arguments (model constructors naturally have many params)
 ]
 
 [tool.ruff.lint.extend-per-file-ignores]

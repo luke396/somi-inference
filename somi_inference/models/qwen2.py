@@ -179,7 +179,12 @@ class QwenAttention(nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch, seq_len, -1)
         return self.o_proj(attn_output)
 
-    def _project_qkv(self, hidden_states, cos, sin):
+    def _project_qkv(
+        self,
+        hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch, seq_len = hidden_states.shape[:2]
         reshape = (batch, seq_len, -1, self.head_dim)
         q = self.q_proj(hidden_states).view(reshape).transpose(1, 2)
@@ -192,7 +197,7 @@ class QwenAttention(nn.Module):
 class QwenDecoderLayer(nn.Module):
     """Single transformer decoder layer: attention + MLP with residual connections."""
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         hidden_size: int,
         intermediate_size: int,
@@ -231,7 +236,7 @@ class QwenDecoderLayer(nn.Module):
 class QwenModel(nn.Module):
     """Full Qwen2.5 transformer: embedding + N decoder layers + final norm."""
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         vocab_size: int,
         hidden_size: int,
