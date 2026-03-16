@@ -1,0 +1,78 @@
+[project]
+name = "somi-inference"
+version = "0.1.0"
+description = "Minimal LLM inference engine"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.4.3",
+    "torch>=2.0.0",
+    "transformers>=4.48.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.14.1",
+    "ty>=0.0.1a16",
+]
+
+[build-system]
+requires = ["uv_build>=0.8.3,<0.9.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "somi_inference"
+module-root = ""
+
+[tool.uv]
+package = true
+python-preference = "managed"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--tb=short",
+    "--cov=somi_inference",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+]
+
+[tool.ruff]
+line-length = 88
+extend-exclude = ["tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+extend-select = ["UP"]
+ignore = [
+    "F722",   # forward-annotation-syntax-error (jaxtyping uses non-standard annotations)
+    "D203",   # incorrect-blank-line-before-class (conflicts with D211)
+    "D213",   # multi-line-summary-second-line (conflicts with D212)
+    "S101",   # assert (allow assert in non-test code)
+    "COM812", # missing-trailing-comma (conflicts with ruff formatter)
+    "T201",   # print (allow print statements)
+    "ERA001", # commented out code (allow commented out code in some cases)
+    "PLR0913", # too-many-arguments (model constructors naturally have many params)
+]
+
+[tool.ruff.lint.extend-per-file-ignores]
+"__init__.py" = [
+    "E402",  # module-import-not-at-top-of-file
+    "F401",  # unused-import (re-exports)
+    "F403",  # undefined-local-with-import-star
+    "E501",  # line-too-long
+]
+
+[tool.ty.src]
+exclude = ["tests/*", "scripts/*"]
