@@ -1,6 +1,8 @@
 # CLAUDE.md
 
-A minimal, self-contained LLM inference framework — focused on implementing the smallest complete set of features needed for real inference, from PyTorch to CUDA/Triton.
+Repository-specific guidance for coding agents working in this repo. Keep this file semantically aligned with `AGENTS.md`; if a rule is not tool-specific, update both files in the same change.
+
+A minimal, self-contained LLM inference framework focused on implementing the smallest complete set of features needed for real inference, from PyTorch to CUDA/Triton.
 
 ## Environment
 
