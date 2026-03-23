@@ -25,13 +25,30 @@ A learning-oriented project that implements core LLM inference components from s
 uv sync
 ```
 
+## Pre-commit
+
+This repo uses `pre-commit` to run `uv run ruff check`, `uv run ty check`,
+and the committed fast test suite (`uv run pytest -m "not slow"`) before
+every commit.
+
+Enable it in a local clone with:
+
+```bash
+uv sync
+uv run pre-commit install
+```
+
 ## Testing
 
 ```bash
-uv run pytest                      # unit tests
+uv run pytest                      # default committed suite
 uv run pytest -m integration       # integration tests (requires GPU)
-uv run pytest --cov                # with coverage
+uv run pytest -m "not slow"        # fast local / pre-commit suite
+uv run pytest tests_tdd/phase2     # Phase 2 TDD / not-yet-green tests
 ```
+
+`tests_tdd/` is intentionally excluded from the default `ruff`, `ty`, and
+`pytest` checks used by `pre-commit`.
 
 ## Project Structure
 

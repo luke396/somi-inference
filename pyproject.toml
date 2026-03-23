@@ -12,6 +12,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "pre-commit>=4.0.0",
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "ruff>=0.14.1",
@@ -50,7 +51,7 @@ markers = [
 
 [tool.ruff]
 line-length = 88
-extend-exclude = ["tests", "scripts"]
+extend-exclude = ["tests", "tests_tdd", "scripts"]
 
 [tool.ruff.lint]
 select = ["ALL"]
@@ -75,4 +76,4 @@ ignore = [
 ]
 
 [tool.ty.src]
-exclude = ["tests/*", "scripts/*"]
+exclude = ["tests/*", "tests_tdd/*", "scripts/*"]

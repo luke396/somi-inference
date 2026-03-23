@@ -27,11 +27,19 @@ tests/
     └── test_paged_attention_integration.py
 ```
 
+Additional future or intentionally not-yet-green TDD coverage lives outside the
+default `tests/` tree under `tests_tdd/phase2/`.
+
 ## Running Tests
 
 ### Run all tests
 ```bash
 pytest
+```
+
+### Run the committed fast suite
+```bash
+pytest -m "not slow"
 ```
 
 ### Run with coverage
@@ -62,6 +70,11 @@ pytest tests/models/test_qwen2.py::TestRMSNorm::test_basic -v
 ### Run integration tests only
 ```bash
 pytest -m integration
+```
+
+### Run Phase 2 TDD tests
+```bash
+pytest tests_tdd/phase2
 ```
 
 ## Test Markers
