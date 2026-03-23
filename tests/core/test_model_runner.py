@@ -1,88 +1,129 @@
 """Tests for ModelRunner."""
 
-import pytest
 import torch
+
 from somi_inference.core.model_runner import ModelRunner
-from somi_inference.core.sampler import Sampler, SamplingParams
 from somi_inference.core.paged_attention import KVCacheManager
-from somi_inference.models.qwen2_adapter import load_from_hf
+from somi_inference.core.sampler import SamplingParams
 
 
-@pytest.fixture
-def qwen_config():
-    """Qwen2.5-0.5B config."""
-    return {
-        "num_hidden_layers": 24,
-        "num_attention_heads": 14,
-        "num_key_value_heads": 2,
-        "hidden_size": 896,
-    }
+class MockAdapter:
+    """Adapter stub that returns deterministic logits."""
+
+    def __init__(self) -> None:
+        self.prefill_calls = []
+        self.decode_calls = []
+        self.prefill_logits = torch.tensor(
+            [
+                [
+                    [0.1, 0.2, 0.3, 0.4],
+                    [1.0, 2.0, 3.0, 4.0],
+                    [5.0, 6.0, 7.0, 8.0],
+                ]
+            ]
+        )
+        self.decode_logits = torch.tensor(
+            [
+                [[1.0, 5.0, 0.0, 0.0]],
+                [[0.0, 0.0, 2.0, 9.0]],
+            ]
+        )
+
+    def prefill(self, input_ids, kv_manager, seq_id):
+        """Return full-sequence logits for prefill."""
+        self.prefill_calls.append(
+            {
+                "input_ids": input_ids.clone(),
+                "kv_manager": kv_manager,
+                "seq_id": seq_id,
+            }
+        )
+        return self.prefill_logits.clone()
+
+    def decode(self, input_ids, kv_manager, seq_ids):
+        """Return one-step logits for batched decode."""
+        self.decode_calls.append(
+            {
+                "input_ids": input_ids.clone(),
+                "kv_manager": kv_manager,
+                "seq_ids": list(seq_ids),
+            }
+        )
+        return self.decode_logits[: input_ids.size(0)].clone()
 
 
-@pytest.fixture
-def model_runner(qwen_config):
-    """Create ModelRunner with Qwen adapter."""
-    adapter = load_from_hf("Qwen/Qwen2.5-0.5B")
-    sampler = Sampler()
-    kv_manager = KVCacheManager(
-        num_layers=qwen_config["num_hidden_layers"],
-        num_kv_heads=qwen_config["num_key_value_heads"],
-        head_dim=qwen_config["hidden_size"] // qwen_config["num_attention_heads"],
-        block_size=16,
-        num_blocks=128,
-        dtype=torch.bfloat16,
-        device="cuda" if torch.cuda.is_available() else "cpu",
+class MockSampler:
+    """Sampler stub that records its inputs."""
+
+    def __init__(self, return_tokens: torch.Tensor) -> None:
+        self.return_tokens = return_tokens
+        self.calls = []
+
+    def sample(self, logits, params, input_ids=None):
+        """Record logits/params and return fixed tokens."""
+        self.calls.append(
+            {
+                "logits": logits.clone(),
+                "params": params,
+                "input_ids": input_ids,
+            }
+        )
+        return self.return_tokens.clone()
+
+
+def make_kv_manager() -> KVCacheManager:
+    """Create a minimal KV cache manager for runner tests."""
+    return KVCacheManager(
+        num_blocks=8,
+        block_size=4,
+        num_kv_heads=2,
+        head_dim=8,
+        n_layers=1,
     )
-    return ModelRunner(adapter, sampler, kv_manager)
 
 
-# ============================================================================
-# Task 8: ModelRunner Prefill Tests
-# ============================================================================
+def test_model_runner_prefill_samples_last_position_logits():
+    """prefill should sample from the last prompt position and return an int."""
+    adapter = MockAdapter()
+    sampler = MockSampler(return_tokens=torch.tensor([2]))
+    kv_manager = make_kv_manager()
+    kv_manager.register_sequence(0)
+    runner = ModelRunner(adapter, sampler, kv_manager)
 
-
-@pytest.mark.slow
-def test_model_runner_prefill_greedy(model_runner):
-    """ModelRunner.prefill with greedy sampling"""
-    input_ids = torch.tensor([[1, 2, 3, 4]])
-    seq_id = 0
     params = SamplingParams(temperature=0.0)
+    token = runner.prefill(torch.tensor([[1, 2, 3]]), seq_id=0, params=params)
 
-    model_runner.kv_manager.register_sequence(seq_id)
-    token = model_runner.prefill(input_ids, seq_id, params)
-
+    assert token == 2
     assert isinstance(token, int)
-    assert token >= 0
+    assert adapter.prefill_calls[0]["seq_id"] == 0
+    torch.testing.assert_close(
+        sampler.calls[0]["logits"],
+        adapter.prefill_logits[:, -1, :],
+    )
+    assert sampler.calls[0]["params"] is params
 
 
-# ============================================================================
-# Task 9: ModelRunner Decode Tests
-# ============================================================================
+def test_model_runner_decode_samples_batched_last_step_logits():
+    """decode should sample one token per sequence from the decode logits."""
+    adapter = MockAdapter()
+    sampler = MockSampler(return_tokens=torch.tensor([1, 3]))
+    kv_manager = make_kv_manager()
+    runner = ModelRunner(adapter, sampler, kv_manager)
 
-
-@pytest.mark.slow
-def test_model_runner_decode_batch(model_runner):
-    """ModelRunner.decode with batch"""
-    # Prefill first
-    input_ids = torch.tensor([[1, 2, 3]])
-    seq_id_0 = 0
-    model_runner.kv_manager.register_sequence(seq_id_0)
-    token_0 = model_runner.prefill(input_ids, seq_id_0, SamplingParams(temperature=0.0))
-
-    seq_id_1 = 1
-    model_runner.kv_manager.register_sequence(seq_id_1)
-    token_1 = model_runner.prefill(input_ids, seq_id_1, SamplingParams(temperature=0.0))
-
-    # Decode batch
-    decode_input = torch.tensor([[token_0], [token_1]])
-    seq_ids = [seq_id_0, seq_id_1]
     params = [
         SamplingParams(temperature=0.0),
-        SamplingParams(temperature=1.0),
+        SamplingParams(temperature=0.8, top_k=10),
     ]
+    tokens = runner.decode(
+        input_ids=torch.tensor([[11], [22]]),
+        seq_ids=[10, 11],
+        params=params,
+    )
 
-    tokens = model_runner.decode(decode_input, seq_ids, params)
-
-    assert tokens.shape == (2,)
-    assert tokens[0].item() >= 0
-    assert tokens[1].item() >= 0
+    torch.testing.assert_close(tokens, torch.tensor([1, 3]))
+    assert adapter.decode_calls[0]["seq_ids"] == [10, 11]
+    torch.testing.assert_close(
+        sampler.calls[0]["logits"],
+        adapter.decode_logits[:, 0, :],
+    )
+    assert sampler.calls[0]["params"] == params

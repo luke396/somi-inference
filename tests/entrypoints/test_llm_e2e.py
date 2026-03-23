@@ -9,10 +9,15 @@ from somi_inference.entrypoints.llm import LLM
 
 def generate_with_hf(prompt: str, max_new_tokens: int) -> str:
     """Generate with HuggingFace for reference."""
+    load_kwargs = {"torch_dtype": torch.bfloat16}
+    if torch.cuda.is_available():
+        load_kwargs["device_map"] = "auto"
+    else:
+        load_kwargs["torch_dtype"] = torch.float32
+
     model = AutoModelForCausalLM.from_pretrained(
         "Qwen/Qwen2.5-0.5B",
-        torch_dtype=torch.bfloat16,
-        device_map="auto" if torch.cuda.is_available() else "cpu",
+        **load_kwargs,
     )
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
 

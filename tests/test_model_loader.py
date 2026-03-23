@@ -1,28 +1,63 @@
 """Tests for Model Loader."""
 
 import pytest
+import transformers
+
+import somi_inference.models.qwen2_adapter as qwen2_adapter_module
+import somi_inference.models.loader as loader_module
 from somi_inference.models.loader import load_model
-from somi_inference.models.base import ModelAdapter
 
 
-# ============================================================================
-# Task 14: Model Loader Tests
-# ============================================================================
+class FakeConfig:
+    """Minimal AutoConfig stub."""
+
+    def __init__(self, model_type: str) -> None:
+        self.model_type = model_type
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a config dict with the fields needed by Phase 2."""
+        return {
+            "model_type": self.model_type,
+            "num_hidden_layers": 24,
+            "num_attention_heads": 14,
+            "num_key_value_heads": 2,
+            "hidden_size": 896,
+        }
 
 
-@pytest.mark.slow
-def test_load_model_qwen():
-    """load_model should load Qwen2 model"""
+def test_load_model_dispatches_qwen_to_qwen_loader(monkeypatch):
+    """load_model should route qwen2 configs to the Qwen adapter loader."""
+    fake_adapter = object()
+    loaded_model_names = []
+
+    def fake_from_pretrained(model_name, *args, **kwargs):
+        loaded_model_names.append(model_name)
+        return FakeConfig(model_type="qwen2")
+
+    monkeypatch.setattr(
+        transformers.AutoConfig,
+        "from_pretrained",
+        fake_from_pretrained,
+    )
+    fake_loader = lambda model_name, *args, **kwargs: fake_adapter
+    monkeypatch.setattr(loader_module, "load_from_hf", fake_loader, raising=False)
+    monkeypatch.setattr(qwen2_adapter_module, "load_from_hf", fake_loader)
+
     adapter, config = load_model("Qwen/Qwen2.5-0.5B")
 
-    assert isinstance(adapter, ModelAdapter)
-    assert isinstance(config, dict)
+    assert adapter is fake_adapter
     assert config["model_type"] == "qwen2"
-    assert "num_hidden_layers" in config
-    assert "num_attention_heads" in config
+    assert config["num_hidden_layers"] == 24
+    assert loaded_model_names == ["Qwen/Qwen2.5-0.5B"]
 
 
-def test_load_model_unsupported():
-    """load_model should raise error for unsupported model"""
+def test_load_model_rejects_unsupported_model_types(monkeypatch):
+    """load_model should fail fast for unsupported model families."""
+    monkeypatch.setattr(
+        transformers.AutoConfig,
+        "from_pretrained",
+        lambda _model_name, *args, **kwargs: FakeConfig(model_type="gpt2"),
+    )
+
     with pytest.raises(ValueError, match="Unsupported model type"):
-        load_model("gpt2")  # Not supported yet
+        load_model("gpt2")

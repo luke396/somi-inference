@@ -221,3 +221,97 @@ def test_batch_sampling_different_params():
     tokens_list = [sampler.sample(logits, params)[1].item() for _ in range(50)]
     unique_tokens = set(tokens_list)
     assert len(unique_tokens) > 1, "Seq 1 should have randomness"
+
+
+# ============================================================================
+# Task 7: Repetition Penalty Tests
+# ============================================================================
+
+
+def test_repetition_penalty_greedy_avoids_repeat():
+    """greedy + repetition_penalty 应该避免选择已出现的 token"""
+    sampler = Sampler()
+    # token 2 的 logit 最高，但 token 2 已经出现过
+    logits = torch.tensor([[1.0, 2.9, 3.0]])
+    params = SamplingParams(temperature=0.0, repetition_penalty=1.5)
+    input_ids = [[2]]  # token 2 已出现
+
+    # penalty 后 token 2 的 logit: 3.0 / 1.5 = 2.0, token 1 仍为 2.9
+    # 应该选 token 1 而不是 token 2
+    tokens = sampler.sample(logits, params, input_ids=input_ids)
+    assert tokens[0].item() == 1
+
+
+def test_repetition_penalty_reduces_repeated_token_prob():
+    """repetition_penalty > 1 应该降低已出现 token 的概率"""
+    sampler = Sampler()
+    logits = torch.tensor([[2.0, 2.0, 2.0]])  # 均匀 logits
+    input_ids = [[0]]  # token 0 已出现
+
+    # 无 penalty：均匀分布
+    params_no_penalty = SamplingParams(temperature=1.0, repetition_penalty=1.0)
+    torch.manual_seed(42)
+    tokens_no_penalty = [sampler.sample(logits, params_no_penalty).item() for _ in range(300)]
+
+    # 有 penalty：token 0 概率应该降低
+    params_with_penalty = SamplingParams(temperature=1.0, repetition_penalty=2.0)
+    torch.manual_seed(42)
+    tokens_with_penalty = [
+        sampler.sample(logits, params_with_penalty, input_ids=input_ids).item()
+        for _ in range(300)
+    ]
+
+    from collections import Counter
+
+    counts_no = Counter(tokens_no_penalty)
+    counts_with = Counter(tokens_with_penalty)
+
+    # token 0 在有 penalty 时出现次数应该明显少于无 penalty
+    assert counts_with[0] < counts_no[0], (
+        f"Token 0 with penalty ({counts_with[0]}) should be less than without ({counts_no[0]})"
+    )
+
+
+def test_repetition_penalty_disabled():
+    """repetition_penalty=1.0 不应该改变分布"""
+    sampler = Sampler()
+    logits = torch.tensor([[1.0, 2.0, 3.0]])
+    params = SamplingParams(temperature=0.0, repetition_penalty=1.0)
+    input_ids = [[2]]  # token 2 已出现，但 penalty=1.0 不生效
+
+    # 应该仍然选择 argmax = token 2
+    tokens = sampler.sample(logits, params, input_ids=input_ids)
+    assert tokens[0].item() == 2
+
+
+def test_repetition_penalty_negative_logits():
+    """repetition_penalty 对负 logit 应该乘以 penalty（使其更负）"""
+    sampler = Sampler()
+    # token 0 有负 logit 且已出现，penalty 应该让它更负（乘以 penalty）
+    logits = torch.tensor([[-1.0, 0.5, 0.5]])
+    params = SamplingParams(temperature=0.0, repetition_penalty=2.0)
+    input_ids = [[0]]
+
+    # token 0: -1.0 * 2.0 = -2.0（更负），token 1 和 2 不变
+    # 应该不选 token 0
+    tokens = sampler.sample(logits, params, input_ids=input_ids)
+    assert tokens[0].item() != 0
+
+
+def test_repetition_penalty_batch_different_history():
+    """batch 内每个 seq 有不同的 token 历史"""
+    sampler = Sampler()
+    # 两个 seq 的 logits 相同，但 token 历史不同
+    logits = torch.tensor([
+        [1.0, 2.9, 3.0],  # seq 0: token 2 已出现
+        [1.0, 2.9, 3.0],  # seq 1: token 1 已出现
+    ])
+    params = SamplingParams(temperature=0.0, repetition_penalty=1.5)
+    input_ids = [
+        [2],  # seq 0: penalize token 2 -> 3.0/1.5=2.0, pick token 1
+        [1],  # seq 1: penalize token 1 -> 2.9/1.5≈1.93, pick token 2
+    ]
+
+    tokens = sampler.sample(logits, params, input_ids=input_ids)
+    assert tokens[0].item() == 1  # seq 0 避开 token 2
+    assert tokens[1].item() == 2  # seq 1 避开 token 1
