@@ -11,7 +11,12 @@ tests/
 ├── conftest.py              # Shared fixtures and configuration
 ├── core/                    # Core functionality tests
 │   ├── test_paged_attention.py
-│   └── test_continuous_batching.py
+│   ├── test_continuous_batching.py
+│   ├── test_model_runner.py
+│   └── test_sampler.py
+├── entrypoints/
+│   ├── test_llm.py          # High-level text-in/text-out API tests
+│   └── test_llm_e2e.py      # High-level slow e2e alignment / smoke tests
 ├── models/                  # Model component tests
 │   ├── test_qwen2.py       # Base components (RMSNorm, RoPE, attention)
 │   ├── test_qwen2_mlp.py
@@ -23,12 +28,11 @@ tests/
 │   ├── test_qwen2_e2e.py   # End-to-end tests (slow)
 │   ├── test_qwen2_error_handling.py
 │   └── test_forward_context.py
+├── test_model_loader.py      # HF config -> adapter dispatch tests
+├── test_tokenizer.py         # Tokenizer wrapper tests
 └── integration/             # Integration tests
     └── test_paged_attention_integration.py
 ```
-
-Additional future or intentionally not-yet-green TDD coverage lives outside the
-default `tests/` tree under `tests_tdd/phase2/`.
 
 ## Running Tests
 
@@ -72,9 +76,9 @@ pytest tests/models/test_qwen2.py::TestRMSNorm::test_basic -v
 pytest -m integration
 ```
 
-### Run Phase 2 TDD tests
+### Run LLM end-to-end slow tests
 ```bash
-pytest tests_tdd/phase2
+pytest tests/entrypoints/test_llm_e2e.py -m slow
 ```
 
 ## Test Markers

@@ -51,7 +51,7 @@ markers = [
 
 [tool.ruff]
 line-length = 88
-extend-exclude = ["tests", "tests_tdd", "scripts"]
+extend-exclude = ["tests", "scripts"]
 
 [tool.ruff.lint]
 select = ["ALL"]
@@ -76,4 +76,4 @@ ignore = [
 ]
 
 [tool.ty.src]
-exclude = ["tests/*", "tests_tdd/*", "scripts/*"]
+exclude = ["tests/*", "scripts/*"]
