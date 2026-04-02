@@ -113,6 +113,12 @@ class Scheduler:
         """Check if there are unfinished sequences."""
         return bool(self.waiting) or bool(self.running)
 
+    def drain_finished(self) -> list[Sequence]:
+        """Return finished sequences accumulated since the last drain."""
+        finished = self.finished
+        self.finished = []
+        return finished
+
 
 class ContinuousBatchingEngine:
     """Engine that coordinates model, KV cache, and scheduler."""
@@ -166,6 +172,8 @@ class ContinuousBatchingEngine:
     ) -> list[Sequence]:
         """Run the engine loop until all requests are finished."""
         step = 0
+        finished_sequences = []
+        self.scheduler.drain_finished()
         with torch.inference_mode():
             while requests or self.scheduler.has_unfinished():
                 # inject all arrivals for this step
@@ -177,10 +185,11 @@ class ContinuousBatchingEngine:
                 # free
                 for seq_id in output.freed_seq_ids:
                     self.model_runner.kv_manager.free_sequence(seq_id)
+                finished_sequences.extend(self.scheduler.drain_finished())
                 # prefill and decode
                 for seq in output.prefill_seq:
                     self._prefill(seq)
                 if output.decode_seq:
                     self._decode_batch(output.decode_seq)
                 step += 1
-        return self.scheduler.finished
+        return finished_sequences

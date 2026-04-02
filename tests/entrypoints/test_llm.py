@@ -197,6 +197,79 @@ def test_llm_generate_multiple_calls_increment_sequence_ids(
     assert llm._next_seq_id == 2
 
 
+def test_llm_generate_reuses_real_engine_without_finished_leak(monkeypatch):
+    """Repeated generate calls should return only the current request output."""
+    config = {
+        "model_type": "qwen2",
+        "num_hidden_layers": 24,
+        "num_attention_heads": 14,
+        "num_key_value_heads": 2,
+        "hidden_size": 896,
+    }
+
+    class FakeTokenizer:
+        def __init__(self, model_name, *args, **kwargs):
+            self.model_name = model_name
+            self.eos_token_id = 151643
+
+        def encode(self, text):
+            return [len(text), len(text) + 1]
+
+        def decode(self, token_ids):
+            return "decoded:" + ",".join(str(token_id) for token_id in token_ids)
+
+    class FakeSampler:
+        def __init__(self):
+            pass
+
+    class FakeKVCacheManager:
+        def __init__(self, *args, **kwargs):
+            self.registered_seq_ids = []
+            self.freed_seq_ids = []
+
+        def register_sequence(self, seq_id):
+            self.registered_seq_ids.append(seq_id)
+
+        def free_sequence(self, seq_id):
+            self.freed_seq_ids.append(seq_id)
+
+    class FakeModelRunner:
+        def __init__(self, *args, **kwargs):
+            if args:
+                self.kv_manager = args[2]
+            else:
+                self.kv_manager = kwargs["kv_manager"]
+
+        def prefill(self, input_ids, seq_id, sampling_params):
+            del input_ids, sampling_params
+            return 100 + seq_id
+
+        def decode(self, input_ids, seq_ids, sampling_params, token_histories):
+            del input_ids, seq_ids, sampling_params, token_histories
+            message = "decode should not be called for max_new_tokens=1"
+            raise AssertionError(message)
+
+    monkeypatch.setattr(
+        llm_module,
+        "load_model",
+        lambda _model_name, *args, **kwargs: (object(), config),
+    )
+    monkeypatch.setattr(llm_module, "Tokenizer", FakeTokenizer)
+    monkeypatch.setattr(llm_module, "KVCacheManager", FakeKVCacheManager)
+    monkeypatch.setattr(llm_module, "Sampler", FakeSampler)
+    monkeypatch.setattr(llm_module, "ModelRunner", FakeModelRunner)
+
+    llm = LLM("Qwen/Qwen2.5-0.5B", num_blocks=128)
+
+    output_0 = llm.generate("Hello", max_new_tokens=1, temperature=0.0)
+    output_1 = llm.generate("World", max_new_tokens=1, temperature=0.0)
+
+    assert output_0 == "decoded:100"
+    assert output_1 == "decoded:101"
+    assert llm.kv_manager.registered_seq_ids == [0, 1]
+    assert llm.kv_manager.freed_seq_ids == [0, 1]
+
+
 def test_llm_generate_stream_not_implemented(patched_llm_dependencies):
     """Streaming remains explicitly out of scope for Phase 2."""
     llm = LLM("Qwen/Qwen2.5-0.5B", num_blocks=128)

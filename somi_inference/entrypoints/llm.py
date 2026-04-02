@@ -86,7 +86,15 @@ class LLM:
         top_p: float = 1.0,
         repetition_penalty: float = 1.0,
     ) -> str:
-        """Generate text for one prompt and return only newly generated text."""
+        """Generate text for one prompt and return only newly generated text.
+
+        This high-level API intentionally models the single-request case: one
+        prompt becomes one `Sequence`, which is submitted to the engine at
+        arrival step 0 and run to completion within this call. The underlying
+        `ContinuousBatchingEngine` still supports multi-sequence scheduling
+        across different arrival steps, but that capability is not yet exposed
+        as a public entrypoint here.
+        """
         prompt_tokens = self.tokenizer.encode(prompt)
         sampling_params = SamplingParams(
             temperature=temperature,

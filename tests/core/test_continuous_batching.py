@@ -280,6 +280,27 @@ class TestContinuousBatchingEngine:
         assert finished[0].output_tokens == [EOS_TOKEN_ID]
         assert runner_impl.decode_calls == []
 
+    def test_run_returns_only_sequences_finished_in_current_invocation(
+        self,
+        kv_manager: KVCacheManager,
+        scheduler: Scheduler,
+    ) -> None:
+        """Repeated engine runs should not leak previously finished sequences."""
+        runner = cast(
+            "ModelRunner",
+            MockModelRunner(
+                kv_manager,
+                prefill_tokens={0: NON_EOS_TOKEN, 1: NON_EOS_TOKEN},
+            ),
+        )
+        engine = ContinuousBatchingEngine(runner, scheduler, eos_token_id=EOS_TOKEN_ID)
+
+        first = engine.run(deque([(0, make_sequence(0, [1, 2, 3], max_new_tokens=1))]))
+        second = engine.run(deque([(0, make_sequence(1, [4, 5, 6], max_new_tokens=1))]))
+
+        assert [seq.seq_id for seq in first] == [0]
+        assert [seq.seq_id for seq in second] == [1]
+
     def test_decode_batch_forwards_full_token_history(
         self,
         kv_manager: KVCacheManager,
