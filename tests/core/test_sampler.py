@@ -81,7 +81,7 @@ def test_repetition_penalty_changes_greedy_choice() -> None:
     logits = torch.tensor([[2.0, 1.5]])
     params = SamplingParams(temperature=0.0, repetition_penalty=2.0)
 
-    tokens = sampler.sample(logits, params, token_history=[[0]])
+    tokens = sampler.sample(logits, params, token_histories=[[0]])
 
     assert tokens.tolist() == [1]
 

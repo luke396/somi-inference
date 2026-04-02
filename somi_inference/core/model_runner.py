@@ -28,11 +28,12 @@ class ModelRunner:
         sampling_params: SamplingParams,
     ) -> int:
         """Run prefill for one sequence and sample the first output token."""
+        assert input_ids.size(0) == 1, "prefill expects a single sequence"
         logits = self.adapter.prefill(input_ids, self.kv_manager, seq_id)
         sampled_token = self.sampler.sample(
             logits[:, -1, :],
             sampling_params,
-            token_history=[input_ids[0].tolist()],
+            token_histories=[input_ids[0].tolist()],
         )
         assert sampled_token.shape[0] == 1, (
             "Expected a single token output for prefill sampling."
@@ -51,7 +52,7 @@ class ModelRunner:
         sampled_tokens = self.sampler.sample(
             logits[:, 0, :],
             sampling_params,
-            token_history=token_histories,
+            token_histories=token_histories,
         )
         assert sampled_tokens.shape[0] == len(seq_ids), (
             "Expected one sampled token per sequence in decode."

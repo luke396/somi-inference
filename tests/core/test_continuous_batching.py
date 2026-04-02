@@ -54,23 +54,23 @@ class MockModelRunner:
         self,
         input_ids: Tensor,
         seq_id: int,
-        params: SamplingParams,
+        sampling_params: SamplingParams,
     ) -> int:
         """Record the prefill request and return a fixed token."""
-        self.prefill_calls.append((input_ids.clone(), seq_id, params))
+        self.prefill_calls.append((input_ids.clone(), seq_id, sampling_params))
         return self.prefill_tokens[seq_id]
 
     def decode(
         self,
         input_ids: Tensor,
         seq_ids: list[int],
-        params: list[SamplingParams],
+        sampling_params: list[SamplingParams],
         token_histories: list[list[int]],
     ) -> Tensor:
         """Record the decode batch and return the next token batch."""
         history_copy = [list(history) for history in token_histories]
         self.decode_calls.append(
-            (input_ids.clone(), list(seq_ids), list(params), history_copy)
+            (input_ids.clone(), list(seq_ids), list(sampling_params), history_copy)
         )
         return self.decode_batches.pop(0).clone()
 

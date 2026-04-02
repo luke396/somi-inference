@@ -32,7 +32,7 @@ class Sampler:
         self,
         logits: Tensor,
         params: SamplingParams | list[SamplingParams],
-        token_history: list[list[int]] | None = None,
+        token_histories: list[list[int]] | None = None,
     ) -> Tensor:
         """Sample one token for each row in a batch of logits."""
         assert logits.ndim == LOGITS_BATCH_NDIM, (
@@ -41,10 +41,14 @@ class Sampler:
 
         batch_size = logits.size(0)
         params_list = self._normalize_params(params, batch_size)
-        token_history_list = self._normalize_token_history(token_history, batch_size)
+        token_histories_list = self._normalize_token_histories(
+            token_histories, batch_size
+        )
 
         logits = logits.clone()
-        logits = self._apply_repetition_penalty(logits, params_list, token_history_list)
+        logits = self._apply_repetition_penalty(
+            logits, params_list, token_histories_list
+        )
         logits = self._apply_temperature(logits, params_list)
         logits = self._apply_top_k(logits, params_list)
         logits = self._apply_top_p(logits, params_list)
@@ -61,27 +65,27 @@ class Sampler:
         assert len(params) == batch_size, "Length of params must match batch size"
         return params
 
-    def _normalize_token_history(
+    def _normalize_token_histories(
         self,
-        token_history: list[list[int]] | None,
+        token_histories: list[list[int]] | None,
         batch_size: int,
     ) -> list[list[int]]:
-        if token_history is None:
+        if token_histories is None:
             return [[] for _ in range(batch_size)]
 
-        assert len(token_history) == batch_size, (
-            "Length of token_history must match batch size"
+        assert len(token_histories) == batch_size, (
+            "Length of token_histories must match batch size"
         )
-        return token_history
+        return token_histories
 
     def _apply_repetition_penalty(
         self,
         logits: Tensor,
         params: list[SamplingParams],
-        token_history: list[list[int]],
+        token_histories: list[list[int]],
     ) -> Tensor:
         for batch_index, (param, history) in enumerate(
-            zip(params, token_history, strict=True)
+            zip(params, token_histories, strict=True)
         ):
             if param.repetition_penalty == 1.0 or not history:
                 continue

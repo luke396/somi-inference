@@ -59,14 +59,14 @@ class MockSampler(Sampler):
         self,
         logits: Tensor,
         params: SamplingParams | list[SamplingParams],
-        token_history: list[list[int]] | None = None,
+        token_histories: list[list[int]] | None = None,
     ) -> Tensor:
         """Record sampler inputs and return predefined tokens."""
-        history_copy = None
-        if token_history is not None:
-            history_copy = [list(history) for history in token_history]
+        histories_copy = None
+        if token_histories is not None:
+            histories_copy = [list(history) for history in token_histories]
 
-        self.calls.append((logits.clone(), params, history_copy))
+        self.calls.append((logits.clone(), params, histories_copy))
         return self.sampled_tokens.clone()
 
 
@@ -119,10 +119,10 @@ def test_model_runner_prefill_samples_last_prompt_position(
     assert adapter_seq_id == PREFILL_SEQ_ID
 
     assert len(sampler.calls) == 1
-    sampler_logits, sampler_params, token_history = sampler.calls[0]
+    sampler_logits, sampler_params, token_histories = sampler.calls[0]
     torch.testing.assert_close(sampler_logits, prefill_logits[:, -1, :])
     assert sampler_params is params
-    assert token_history == [[11, 12, 13]]
+    assert token_histories == [[11, 12, 13]]
 
 
 def test_model_runner_decode_samples_batch_and_forwards_histories(
