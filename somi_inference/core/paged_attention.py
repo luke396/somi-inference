@@ -55,10 +55,21 @@ class KVCache:
         block_size: int,
         num_kv_heads: int,
         head_dim: int,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype = torch.float32,
     ) -> None:
         """Initialize the KV cache with pre-allocated space for keys and values."""
-        self.key_cache = torch.zeros((num_blocks, block_size, num_kv_heads, head_dim))
-        self.value_cache = torch.zeros((num_blocks, block_size, num_kv_heads, head_dim))
+        self.key_cache = torch.zeros(
+            (num_blocks, block_size, num_kv_heads, head_dim),
+            device=device,
+            dtype=dtype,
+        )
+        self.value_cache = torch.zeros(
+            (num_blocks, block_size, num_kv_heads, head_dim),
+            device=device,
+            dtype=dtype,
+        )
 
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -94,18 +105,27 @@ class KVCacheManager:
         num_kv_heads: int,
         head_dim: int,
         n_layers: int = 1,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype = torch.float32,
     ) -> None:
         """Initialize the KV cache manager."""
         self.allocator = BlockAllocator(
             num_blocks=num_blocks,
         )
         self.n_layers = n_layers
+        self.device = (
+            torch.device(device) if device is not None else torch.device("cpu")
+        )
+        self.dtype = dtype
         self.kv_caches = [
             KVCache(
                 num_blocks=num_blocks,
                 block_size=block_size,
                 num_kv_heads=num_kv_heads,
                 head_dim=head_dim,
+                device=self.device,
+                dtype=self.dtype,
             )
             for _ in range(self.n_layers)
         ]  # every layer has its own KVCache, block IDs are shared across layers
@@ -149,11 +169,17 @@ class KVCacheManager:
         """
         block_ids_list = [self.get_block_ids(sid) for sid in seq_ids]
         max_blocks = max(len(b) for b in block_ids_list)
-        block_tables = torch.zeros(len(seq_ids), max_blocks, dtype=torch.long)
+        block_tables = torch.zeros(
+            len(seq_ids), max_blocks, dtype=torch.long, device=self.device
+        )
         for i, bids in enumerate(block_ids_list):
-            block_tables[i, : len(bids)] = torch.tensor(bids, dtype=torch.long)
+            block_tables[i, : len(bids)] = torch.tensor(
+                bids, dtype=torch.long, device=self.device
+            )
         seq_lens = torch.tensor(
-            [self.get_num_tokens(sid) for sid in seq_ids], dtype=torch.long
+            [self.get_num_tokens(sid) for sid in seq_ids],
+            dtype=torch.long,
+            device=self.device,
         )
         return block_tables, seq_lens
 
@@ -233,9 +259,21 @@ def paged_attention_decode(
     block_tables: torch.Tensor,  # (num_seqs, max_blocks_per_seq)
     seq_lens: torch.Tensor,  # (num_seqs,)
 ) -> torch.Tensor:
-    """Compute paged attention decode with online softmax over KV cache blocks."""
+    """Compute paged attention decode with online softmax over KV cache blocks.
+
+    Precision policy matches ``causal_attention()``:
+    keep ``q @ k`` and the final ``weights @ v`` accumulation in the incoming
+    activation dtype, but maintain the online softmax state in ``float32`` when
+    the inputs are ``float16``/``bfloat16``.
+    """
     num_q_heads = q.shape[1]
     num_kv_heads = key_cache.shape[2]
+    # Only the softmax path is promoted; matmuls stay in the incoming dtype.
+    softmax_dtype = (
+        torch.float32
+        if q.dtype in {torch.float16, torch.bfloat16}
+        else q.dtype
+    )
     # GQA:repeat KV heads to match Q heads
     # Simply copy q_heads to match kv_heads, maybe some memory waste
     if num_q_heads != num_kv_heads:
@@ -250,7 +288,10 @@ def paged_attention_decode(
 
     scale_factor = 1 / sqrt(q.shape[-1])
     seq_score_max = torch.full(
-        (q.shape[0], q.shape[1]), -torch.inf, device=q.device
+        (q.shape[0], q.shape[1]),
+        -torch.inf,
+        device=q.device,
+        dtype=softmax_dtype,
     )  # (num_seqs, num_heads)
     output = torch.zeros_like(q)  # (num_seqs, num_heads, head_dim)
     running_sum = torch.zeros_like(seq_score_max)  # (num_seqs, num_heads)
@@ -265,13 +306,12 @@ def paged_attention_decode(
             1
         )  # (num_seqs, block_size)
         block_ids = block_tables[:, block_n]  # (num_seqs,)
-        key_block = key_cache[block_ids]  # (num_seqs, block_size, num_heads, head_dim)
-        value_block = value_cache[
-            block_ids
-        ]  # (num_seqs, block_size, num_heads, head_dim)
+        key_block = key_cache[block_ids]
+        value_block = value_cache[block_ids]
         scores = (
-            torch.einsum("s h d, s b h d -> s h b", q, key_block) * scale_factor
-        )  # (num_seqs, num_heads, block_size)
+            torch.einsum("s h d, s b h d -> s h b", q, key_block)
+            * scale_factor
+        ).to(softmax_dtype)  # (num_seqs, num_heads, block_size)
         scores = scores.masked_fill(invalid_position_msk.unsqueeze(1), -torch.inf)
 
         block_max = scores.max(dim=-1)  # (num_seqs, num_heads)
@@ -279,17 +319,21 @@ def paged_attention_decode(
             seq_score_max, block_max.values
         )  # (num_seqs, num_heads)
         correction = torch.exp(seq_score_max - running_max)  # (num_seqs, num_heads)
-        output *= correction.unsqueeze(-1)  # (num_seqs, num_heads, head_dim)
+        output *= correction.unsqueeze(-1).to(
+            output.dtype
+        )  # (num_seqs, num_heads, head_dim)
         running_sum *= correction  # (num_seqs, num_heads)
         weights = torch.exp(
             scores - running_max.unsqueeze(-1)
         )  # (num_seqs, num_heads, block_size)
         output += torch.einsum(
-            "s h b, s b h d -> s h d", weights, value_block
+            "s h b, s b h d -> s h d", weights.to(value_block.dtype), value_block
         )  # (num_seqs, num_heads, head_dim)
         running_sum += weights.sum(dim=-1)  # (num_seqs, num_heads)
         seq_score_max = running_max
 
-    output /= running_sum.unsqueeze(-1)  # (num_seqs, num_heads, head_dim)
+    output /= running_sum.unsqueeze(-1).to(
+        output.dtype
+    )  # (num_seqs, num_heads, head_dim)
 
     return output

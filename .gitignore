@@ -45,6 +45,11 @@ Thumbs.db
 # Internal planning documents
 docs/plans/
 .claude/
+/AGENTS.md
+/CLAUDE.md
 
 # Git worktrees
 .worktrees/
+
+# Local benchmark outputs
+benchmarks/results/

@@ -18,7 +18,7 @@ class TestQwen2E2E:
         # Load HF model
         tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
         hf_model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME, torch_dtype=torch.float32,
+            MODEL_NAME, dtype=torch.float32,
         )
         hf_model.requires_grad_(False)
 

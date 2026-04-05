@@ -179,9 +179,7 @@ def load_from_hf(model_name: str) -> QwenAdapter:
     )
 
     # Load HF weights
-    hf_model = AutoModelForCausalLM.from_pretrained(
-        model_name, torch_dtype=torch.float32
-    )
+    hf_model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.float32)
     hf_state_dict = hf_model.state_dict()
 
     # Map and load weights

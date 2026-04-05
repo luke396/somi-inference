@@ -225,6 +225,20 @@ class TestCausalAttention:
         # With seq_len=1, output = v (softmax of single element = 1.0)
         torch.testing.assert_close(out, v)
 
+    @pytest.mark.parametrize(("dtype",), [(torch.float16,), (torch.bfloat16,)])
+    def test_reduced_precision_inputs(self, dtype: torch.dtype) -> None:
+        """Reduced-precision inputs should not fail in the value projection step."""
+        torch.manual_seed(42)
+        q = torch.randn(1, 4, 8, 16, dtype=dtype)
+        k = torch.randn(1, 2, 8, 16, dtype=dtype)
+        v = torch.randn(1, 2, 8, 16, dtype=dtype)
+
+        out = causal_attention(q, k, v)
+
+        assert out.shape == (1, 4, 8, 16)
+        assert out.dtype == dtype
+        assert torch.isfinite(out.float()).all()
+
 
 @pytest.mark.parametrize("num_q_heads,num_kv_heads", [
     (4, 4),   # MHA
