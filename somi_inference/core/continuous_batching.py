@@ -134,10 +134,15 @@ class ContinuousBatchingEngine:
         self.scheduler = scheduler
         self.eos_token_id = eos_token_id
 
+    def _input_device(self) -> torch.device:
+        return self.model_runner.kv_manager.kv_caches[0].key_cache.device
+
     def _prefill(self, seq: Sequence) -> None:
         self.model_runner.kv_manager.register_sequence(seq.seq_id)
         token = self.model_runner.prefill(
-            torch.tensor([seq.prompt_tokens]),  seq.seq_id, seq.sampling_params
+            torch.tensor([seq.prompt_tokens], device=self._input_device()),
+            seq.seq_id,
+            seq.sampling_params,
         )  # (1, prompt_len, vocab_size)
         seq.output_tokens.append(token)
         self._check_finished(seq, token)
@@ -155,11 +160,16 @@ class ContinuousBatchingEngine:
     def _decode_batch(self, seqs: list[Sequence]) -> None:
         input_ids = torch.tensor([seq.output_tokens[-1] for seq in seqs]).unsqueeze(
             1
+        ).to(
+            self._input_device()
         )  # (batch_size, 1)
         seq_ids = [seq.seq_id for seq in seqs]
-        token_histories = [seq.prompt_tokens +  seq.output_tokens for seq in seqs]
+        token_histories = [seq.prompt_tokens + seq.output_tokens for seq in seqs]
         tokens = self.model_runner.decode(
-            input_ids,  seq_ids, [seq.sampling_params for seq in seqs], token_histories
+            input_ids,
+            seq_ids,
+            [seq.sampling_params for seq in seqs],
+            token_histories,
         )  # (batch_size, 1, vocab_size)
         for i, seq in enumerate(seqs):
             token = int(tokens[i].item())

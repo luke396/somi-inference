@@ -9,24 +9,26 @@ from somi_inference.entrypoints.llm import LLM
 MODEL_NAME = "Qwen/Qwen2.5-0.5B"
 
 
-def generate_with_hf(prompt: str, max_new_tokens: int) -> str:
+def generate_with_hf(
+    prompt: str,
+    max_new_tokens: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> str:
     """Generate reference output with Hugging Face."""
-    load_kwargs = {"torch_dtype": torch.bfloat16}
-    if torch.cuda.is_available():
-        load_kwargs["device_map"] = "auto"
-    else:
-        load_kwargs["torch_dtype"] = torch.float32
-
-    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, **load_kwargs)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, dtype=dtype)
+    model = model.to(device)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-    input_ids = tokenizer.encode(prompt, return_tensors="pt", add_special_tokens=False)
-    if torch.cuda.is_available():
-        input_ids = input_ids.cuda()
+    inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+    input_ids = inputs["input_ids"].to(device)
+    attention_mask = inputs["attention_mask"].to(device)
 
     with torch.inference_mode():
         output_ids = model.generate(
             input_ids,
+            attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
             do_sample=False,
             pad_token_id=tokenizer.eos_token_id,
@@ -44,7 +46,12 @@ def test_llm_e2e_greedy_alignment() -> None:
 
     llm = LLM(MODEL_NAME, num_blocks=128)
     somi_output = llm.generate(prompt, max_new_tokens=max_new_tokens, temperature=0.0)
-    hf_output = generate_with_hf(prompt, max_new_tokens)
+    hf_output = generate_with_hf(
+        prompt,
+        max_new_tokens,
+        device=llm.device,
+        dtype=llm.dtype,
+    )
 
     assert somi_output == hf_output, f"somi: {somi_output!r}, hf: {hf_output!r}"
 

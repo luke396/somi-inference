@@ -121,10 +121,29 @@ class TestKVCacheManager:
         manager.register_sequence(seq_id=0)
         assert 0 in manager.seq_to_block
         assert manager.get_num_tokens(0) == 0
+        manager.allocate_slots(seq_id=0, new_num_tokens=1)
+        block_id = manager.get_block_ids(0)[0]
+        assert block_id in manager.allocator.ref_cnt
 
         # Free sequence
         manager.free_sequence(seq_id=0)
         assert 0 not in manager.seq_to_block
+        assert block_id not in manager.allocator.ref_cnt
+
+    def test_register_sequence_rejects_duplicate_ids(self):
+        """Registering the same sequence twice should raise an error."""
+        manager = KVCacheManager(
+            num_blocks=10,
+            block_size=8,
+            num_kv_heads=4,
+            head_dim=16,
+            n_layers=2,
+        )
+
+        manager.register_sequence(seq_id=0)
+
+        with pytest.raises(ValueError, match="already registered"):
+            manager.register_sequence(seq_id=0)
 
     def test_allocate_slots(self):
         """Test slot allocation."""
@@ -320,6 +339,82 @@ class TestPagedAttentionDecode:
         output = paged_attention_decode(q, key_cache, value_cache, block_tables, seq_lens)
 
         assert output.shape == (num_seqs, num_heads, head_dim)
+
+    def test_bfloat16_cpu_support(self, device, seed):
+        """Test CPU bfloat16 inputs do not fail during decode attention."""
+        num_seqs = 1
+        num_heads = 4
+        head_dim = 16
+        num_blocks = 2
+        block_size = 4
+
+        q = torch.randn(num_seqs, num_heads, head_dim, dtype=torch.bfloat16)
+        key_cache = torch.randn(
+            num_blocks,
+            block_size,
+            num_heads,
+            head_dim,
+            dtype=torch.bfloat16,
+        )
+        value_cache = torch.randn_like(key_cache)
+        block_tables = torch.tensor([[0, 1]])
+        seq_lens = torch.tensor([6])
+
+        output = paged_attention_decode(q, key_cache, value_cache, block_tables, seq_lens)
+
+        assert output.dtype == torch.bfloat16
+        assert output.shape == (num_seqs, num_heads, head_dim)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_reduced_precision_matches_dense_reference(
+        self, dtype: torch.dtype
+    ) -> None:
+        """Reduced-precision decode should match dense attention with float32 softmax only."""
+        torch.manual_seed(42)
+        num_seqs = 1
+        num_heads = 4
+        head_dim = 16
+        num_blocks = 2
+        block_size = 4
+        seq_len = 6
+
+        q = torch.randn(num_seqs, num_heads, head_dim, dtype=dtype)
+        key_cache = torch.randn(
+            num_blocks,
+            block_size,
+            num_heads,
+            head_dim,
+            dtype=dtype,
+        )
+        value_cache = torch.randn_like(key_cache)
+        block_tables = torch.tensor([[1, 0]])
+        seq_lens = torch.tensor([seq_len])
+
+        output = paged_attention_decode(
+            q, key_cache, value_cache, block_tables, seq_lens
+        )
+
+        dense_keys = torch.stack(
+            [
+                key_cache[block_tables[0, pos // block_size], pos % block_size]
+                for pos in range(seq_len)
+            ],
+            dim=0,
+        ).unsqueeze(0)
+        dense_values = torch.stack(
+            [
+                value_cache[block_tables[0, pos // block_size], pos % block_size]
+                for pos in range(seq_len)
+            ],
+            dim=0,
+        ).unsqueeze(0)
+        scores = torch.einsum("s h d, s t h d -> s h t", q, dense_keys)
+        scores = (scores * (head_dim ** -0.5)).to(torch.float32)
+        attn = torch.softmax(scores, dim=-1).to(dense_values.dtype)
+        expected = torch.einsum("s h t, s t h d -> s h d", attn, dense_values)
+
+        assert output.dtype == dtype
+        torch.testing.assert_close(output, expected, atol=5e-2, rtol=5e-2)
 
     def test_gqa_invalid_ratio(self, device, seed):
         """Test that invalid GQA ratio raises assertion error."""

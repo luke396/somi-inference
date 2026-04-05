@@ -1,6 +1,7 @@
 """Tests for the high-level LLM API."""
 
 import pytest
+import torch
 
 import somi_inference.entrypoints.llm as llm_module
 from somi_inference.entrypoints.llm import LLM
@@ -16,7 +17,35 @@ def patched_llm_dependencies(monkeypatch):
             1: [201],
         },
     }
-    adapter = object()
+
+    class FakeTorchModule(torch.nn.Module):
+        """Torch module stub used to verify device and mode setup."""
+
+        def __init__(self):
+            super().__init__()
+            self.to_kwargs = None
+            self.eval_called = False
+            self.requires_grad_value = None
+
+        def to(self, *args, **kwargs):
+            self.to_kwargs = kwargs
+            return self
+
+        def eval(self):
+            self.eval_called = True
+            return self
+
+        def requires_grad_(self, requires_grad=True):
+            self.requires_grad_value = requires_grad
+            return self
+
+    class FakeAdapter:
+        """Adapter stub that exposes a torch.nn.Module model."""
+
+        def __init__(self):
+            self.model = FakeTorchModule()
+
+    adapter = FakeAdapter()
     config = {
         "model_type": "qwen2",
         "num_hidden_layers": 24,
@@ -125,6 +154,7 @@ def patched_llm_dependencies(monkeypatch):
     monkeypatch.setattr(llm_module, "ContinuousBatchingEngine", FakeEngine)
     registry["adapter"] = adapter
     registry["config"] = config
+    registry["model"] = adapter.model
     return registry
 
 
@@ -147,6 +177,44 @@ def test_llm_initialization_wires_phase2_components(patched_llm_dependencies):
     assert runner.adapter is patched_llm_dependencies["adapter"]
     assert runner.sampler is patched_llm_dependencies["sampler"]
     assert runner.kv_manager is patched_llm_dependencies["kv_manager"]
+
+
+def test_llm_initialization_defaults_to_cuda_when_available(
+    monkeypatch,
+    patched_llm_dependencies,
+):
+    """LLM should prefer CUDA by default when torch reports it is available."""
+    monkeypatch.setattr(llm_module.torch.cuda, "is_available", lambda: True)
+
+    llm = LLM("Qwen/Qwen2.5-0.5B", num_blocks=128)
+
+    assert llm.device == torch.device("cuda")
+    kv_kwargs = patched_llm_dependencies["kv_manager"].kwargs
+    assert kv_kwargs["device"] == torch.device("cuda")
+    assert patched_llm_dependencies["model"].to_kwargs["device"] == torch.device("cuda")
+
+
+def test_llm_initialization_forwards_device_and_dtype(patched_llm_dependencies):
+    """LLM should forward device and dtype to the KV cache manager."""
+    llm = LLM(
+        "Qwen/Qwen2.5-0.5B",
+        num_blocks=128,
+        device="cpu",
+        dtype=torch.bfloat16,
+    )
+
+    assert llm.device == torch.device("cpu")
+    assert llm.dtype == torch.bfloat16
+    kv_kwargs = patched_llm_dependencies["kv_manager"].kwargs
+    assert kv_kwargs["device"] == torch.device("cpu")
+    assert kv_kwargs["dtype"] == torch.bfloat16
+    model = patched_llm_dependencies["model"]
+    assert model.to_kwargs == {
+        "device": torch.device("cpu"),
+        "dtype": torch.bfloat16,
+    }
+    assert model.eval_called is True
+    assert model.requires_grad_value is False
 
 
 def test_llm_generate_builds_request_and_decodes_generated_tokens(
@@ -226,6 +294,9 @@ def test_llm_generate_reuses_real_engine_without_finished_leak(monkeypatch):
         def __init__(self, *args, **kwargs):
             self.registered_seq_ids = []
             self.freed_seq_ids = []
+            self.kv_caches = [
+                type("FakeCache", (), {"key_cache": torch.zeros(1)})(),
+            ]
 
         def register_sequence(self, seq_id):
             self.registered_seq_ids.append(seq_id)

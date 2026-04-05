@@ -102,7 +102,12 @@ def causal_attention(
     k: torch.Tensor,  # (batch_size, num_kv_heads, seq_len, head_dim)
     v: torch.Tensor,  # (batch_size, num_kv_heads, seq_len, head_dim)
 ) -> torch.Tensor:
-    """Compute causal self-attention with GQA support for prefill."""
+    """Compute causal self-attention with GQA support for prefill.
+
+    Precision policy matches ``paged_attention_decode()``:
+    keep ``q @ k`` and ``attn @ v`` in the incoming activation dtype, but run
+    the softmax logits/probabilities in ``float32`` for numerical stability.
+    """
     num_q_heads = q.shape[1]
     num_kv_heads = k.shape[1]
     if num_q_heads % num_kv_heads != 0:
@@ -123,7 +128,8 @@ def causal_attention(
         torch.full((seq_len, seq_len), float("-inf"), device=q.device), diagonal=1
     )
     scores = scores + mask
-    attn = torch.softmax(scores, dim=-1, dtype=torch.float32)
+    # Softmax stays in float32, then cast weights back before the value matmul.
+    attn = torch.softmax(scores, dim=-1, dtype=torch.float32).to(v.dtype)
     return torch.einsum("bhij,bhjd->bhid", attn, v)
 
 

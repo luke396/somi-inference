@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections import deque
 from typing import TYPE_CHECKING
 
+import torch
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -40,10 +42,21 @@ class LLM:
         num_blocks: int = 256,
         block_size: int = DEFAULT_BLOCK_SIZE,
         max_concurrent: int = DEFAULT_MAX_CONCURRENT,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype = torch.float32,
     ) -> None:
         """Initialize tokenizer, model, KV cache, scheduler, and engine."""
+        self.device = torch.device(device) if device is not None else torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        self.dtype = dtype
         self.tokenizer = Tokenizer(model_name)
         adapter, config = load_model(model_name)
+        model = getattr(adapter, "model", None)
+        if isinstance(model, torch.nn.Module):
+            model.to(device=self.device, dtype=self.dtype)
+            model.eval()
+            model.requires_grad_(requires_grad=False)
 
         hidden_size = _require_int(config, "hidden_size")
         num_attention_heads = _require_int(config, "num_attention_heads")
@@ -61,6 +74,8 @@ class LLM:
             num_kv_heads=num_key_value_heads,
             head_dim=head_dim,
             n_layers=n_layers,
+            device=self.device,
+            dtype=self.dtype,
         )
         self.sampler = Sampler()
         self.model_runner = ModelRunner(adapter, self.sampler, self.kv_manager)

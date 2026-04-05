@@ -1,10 +1,12 @@
 """Tests for QwenAdapter."""
 
 import torch
+from transformers.models.auto.configuration_auto import AutoConfig
+from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 
 from somi_inference.core.paged_attention import KVCacheManager
 from somi_inference.models.qwen2 import QwenModel
-from somi_inference.models.qwen2_adapter import QwenAdapter
+from somi_inference.models.qwen2_adapter import QwenAdapter, load_from_hf
 
 ADAPTER_CONFIG = dict(
     vocab_size=100,
@@ -124,3 +126,64 @@ class TestQwenAdapterConsistency:
             next_token = logits[:, 0, :].argmax(dim=-1, keepdim=True)
 
         assert kv.get_num_tokens(0) == 9  # 6 prefill + 3 decode
+
+
+def test_load_from_hf_loads_mapped_weights(monkeypatch):
+    """load_from_hf should map HF keys into a frozen QwenAdapter model."""
+    rope_theta = 12345.0
+    reference_model = QwenModel(**ADAPTER_CONFIG, rms_norm_eps=1e-6, rope_theta=rope_theta)
+    hf_state_dict = {}
+    for key, tensor in reference_model.state_dict().items():
+        if key == "token_embedding.weight":
+            hf_key = "model.embed_tokens.weight"
+        elif key == "final_layernorm.weight":
+            hf_key = "model.norm.weight"
+        else:
+            hf_key = f"model.{key}"
+        hf_state_dict[hf_key] = tensor.clone()
+    hf_state_dict["lm_head.weight"] = reference_model.token_embedding.weight.clone()
+    hf_state_dict["model.layers.0.self_attn.rotary_emb.inv_freq"] = torch.ones(
+        ADAPTER_CONFIG["head_dim"] // 2
+    )
+
+    class FakeConfig:
+        vocab_size = ADAPTER_CONFIG["vocab_size"]
+        hidden_size = ADAPTER_CONFIG["hidden_size"]
+        intermediate_size = ADAPTER_CONFIG["intermediate_size"]
+        num_hidden_layers = ADAPTER_CONFIG["num_hidden_layers"]
+        num_attention_heads = ADAPTER_CONFIG["num_attention_heads"]
+        num_key_value_heads = ADAPTER_CONFIG["num_key_value_heads"]
+        max_position_embeddings = ADAPTER_CONFIG["max_seq_size"]
+        rms_norm_eps = 1e-6
+        rope_parameters = {"rope_theta": rope_theta}
+
+    class FakeHFModel:
+        def state_dict(self):
+            return hf_state_dict
+
+    def fake_config_from_pretrained(model_name):
+        assert model_name == "fake/qwen"
+        return FakeConfig()
+
+    def fake_model_from_pretrained(model_name, dtype):
+        assert model_name == "fake/qwen"
+        assert dtype == torch.float32
+        return FakeHFModel()
+
+    monkeypatch.setattr(
+        AutoConfig,
+        "from_pretrained",
+        staticmethod(fake_config_from_pretrained),
+    )
+    monkeypatch.setattr(
+        AutoModelForCausalLM,
+        "from_pretrained",
+        staticmethod(fake_model_from_pretrained),
+    )
+
+    adapter = load_from_hf("fake/qwen")
+
+    assert isinstance(adapter, QwenAdapter)
+    for key, tensor in reference_model.state_dict().items():
+        assert torch.equal(adapter.model.state_dict()[key], tensor)
+    assert all(not parameter.requires_grad for parameter in adapter.model.parameters())
