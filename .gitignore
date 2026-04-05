@@ -50,3 +50,6 @@ docs/plans/
 
 # Git worktrees
 .worktrees/
+
+# Local benchmark outputs
+benchmarks/results/
