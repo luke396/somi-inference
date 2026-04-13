@@ -1,12 +1,39 @@
 """Tests for paged attention components."""
+
+from __future__ import annotations
+
 import pytest
 import torch
+
 from somi_inference.core.paged_attention import (
     BlockAllocator,
     KVCache,
     KVCacheManager,
+    pack_kv_cache,
     paged_attention_decode,
+    paged_attention_decode_torch_ref,
 )
+
+
+def _make_random_kv_cache(
+    num_blocks: int,
+    block_size: int,
+    num_kv_heads: int,
+    head_dim: int,
+    *,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    key_cache = torch.randn(
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    value_cache = torch.randn_like(key_cache)
+    return pack_kv_cache(key_cache, value_cache)
 
 
 class TestBlockAllocator:
@@ -17,13 +44,11 @@ class TestBlockAllocator:
         allocator = BlockAllocator(num_blocks=10)
         assert allocator.num_free_blocks() == 10
 
-        # Allocate a block
         block_id = allocator.allocate()
         assert allocator.num_free_blocks() == 9
         assert block_id in allocator.ref_cnt
         assert allocator.ref_cnt[block_id] == 1
 
-        # Free the block
         allocator.free(block_id)
         assert allocator.num_free_blocks() == 10
         assert block_id not in allocator.ref_cnt
@@ -33,16 +58,13 @@ class TestBlockAllocator:
         allocator = BlockAllocator(num_blocks=5)
         block_id = allocator.allocate()
 
-        # Increase reference count
         allocator.increase_ref(block_id)
         assert allocator.ref_cnt[block_id] == 2
 
-        # First free should not release the block
         allocator.free(block_id)
         assert allocator.num_free_blocks() == 4
         assert block_id in allocator.ref_cnt
 
-        # Second free should release the block
         allocator.free(block_id)
         assert allocator.num_free_blocks() == 5
         assert block_id not in allocator.ref_cnt
@@ -52,10 +74,8 @@ class TestBlockAllocator:
         allocator = BlockAllocator(num_blocks=5)
         block_id = allocator.allocate()
 
-        # Single reference - no COW needed
         assert not allocator.need_cow(block_id)
 
-        # Multiple references - COW needed
         allocator.increase_ref(block_id)
         assert allocator.need_cow(block_id)
 
@@ -64,42 +84,33 @@ class TestKVCache:
     """Test KVCache functionality."""
 
     def test_write_and_read(self, device):
-        """Test writing and reading KV cache."""
-        num_blocks = 4
-        block_size = 8
-        num_heads = 4
-        head_dim = 16
-
+        """Test writing and reading fused KV cache."""
         cache = KVCache(
-            num_blocks=num_blocks,
-            block_size=block_size,
-            num_kv_heads=num_heads,
-            head_dim=head_dim,
+            num_blocks=4,
+            block_size=8,
+            num_kv_heads=4,
+            head_dim=16,
         )
-
-        # Write to cache
-        key = torch.randn(num_heads, head_dim)
-        value = torch.randn(num_heads, head_dim)
+        key = torch.randn(4, 16)
+        value = torch.randn(4, 16)
         cache.write(block_id=0, slot=3, key=key, value=value)
 
-        # Verify write
+        assert cache.kv_cache.shape == (4, 2, 8, 4, 16)
         assert torch.allclose(cache.key_cache[0, 3], key)
         assert torch.allclose(cache.value_cache[0, 3], value)
 
     def test_copy_block(self, device):
-        """Test block copying."""
+        """Test fused block copying."""
         cache = KVCache(num_blocks=4, block_size=8, num_kv_heads=4, head_dim=16)
 
-        # Write to source block
         for slot in range(8):
             key = torch.randn(4, 16)
             value = torch.randn(4, 16)
             cache.write(block_id=0, slot=slot, key=key, value=value)
 
-        # Copy block
         cache.copy_block(src_block_id=0, dst_block_id=1)
 
-        # Verify copy
+        assert torch.allclose(cache.kv_cache[0], cache.kv_cache[1])
         assert torch.allclose(cache.key_cache[0], cache.key_cache[1])
         assert torch.allclose(cache.value_cache[0], cache.value_cache[1])
 
@@ -116,8 +127,6 @@ class TestKVCacheManager:
             head_dim=16,
             n_layers=2,
         )
-
-        # Register sequence
         manager.register_sequence(seq_id=0)
         assert 0 in manager.seq_to_block
         assert manager.get_num_tokens(0) == 0
@@ -125,7 +134,6 @@ class TestKVCacheManager:
         block_id = manager.get_block_ids(0)[0]
         assert block_id in manager.allocator.ref_cnt
 
-        # Free sequence
         manager.free_sequence(seq_id=0)
         assert 0 not in manager.seq_to_block
         assert block_id not in manager.allocator.ref_cnt
@@ -139,7 +147,6 @@ class TestKVCacheManager:
             head_dim=16,
             n_layers=2,
         )
-
         manager.register_sequence(seq_id=0)
 
         with pytest.raises(ValueError, match="already registered"):
@@ -149,18 +156,14 @@ class TestKVCacheManager:
         """Test slot allocation."""
         manager = KVCacheManager(
             num_blocks=10,
-            block_size=4,  # Small block size for testing
+            block_size=4,
             num_kv_heads=2,
             head_dim=8,
             n_layers=1,
         )
-
         manager.register_sequence(seq_id=0)
-
-        # Allocate 5 tokens (should use 2 blocks: 4 + 1)
         manager.allocate_slots(seq_id=0, new_num_tokens=5)
-        block_ids = manager.get_block_ids(0)
-        assert len(block_ids) == 2
+        assert len(manager.get_block_ids(0)) == 2
 
     def test_fork_sequence(self):
         """Test sequence forking with COW."""
@@ -171,25 +174,18 @@ class TestKVCacheManager:
             head_dim=8,
             n_layers=1,
         )
-
-        # Setup source sequence
         manager.register_sequence(seq_id=0)
         manager.allocate_slots(seq_id=0, new_num_tokens=4)
         manager.advance_tokens(seq_id=0, num_tokens=4)
-
-        # Fork sequence
         manager.fork_sequence(src_seq_id=0, dst_seq_id=1)
 
-        # Verify fork
         assert manager.get_block_ids(0) == manager.get_block_ids(1)
         assert manager.get_num_tokens(0) == manager.get_num_tokens(1)
-
-        # Verify reference count increased
         block_id = manager.get_block_ids(0)[0]
         assert manager.allocator.ref_cnt[block_id] == 2
 
     def test_copy_on_write(self):
-        """Test COW when writing to shared block."""
+        """Test COW when writing to a shared partial block."""
         manager = KVCacheManager(
             num_blocks=10,
             block_size=4,
@@ -197,21 +193,14 @@ class TestKVCacheManager:
             head_dim=8,
             n_layers=1,
         )
-
-        # Setup and fork with partial block
         manager.register_sequence(seq_id=0)
-        manager.allocate_slots(seq_id=0, new_num_tokens=3)  # Partial block
+        manager.allocate_slots(seq_id=0, new_num_tokens=3)
         manager.advance_tokens(seq_id=0, num_tokens=3)
         manager.fork_sequence(src_seq_id=0, dst_seq_id=1)
 
         original_block_id = manager.get_block_ids(1)[0]
-
-        # Allocate more slots for seq 1 (should trigger COW since slot > 0)
         manager.allocate_slots(seq_id=1, new_num_tokens=1)
-
-        # Verify COW happened
-        new_block_id = manager.get_block_ids(1)[0]
-        assert new_block_id != original_block_id
+        assert manager.get_block_ids(1)[0] != original_block_id
 
     def test_build_block_tables(self):
         """Test block table construction."""
@@ -222,8 +211,6 @@ class TestKVCacheManager:
             head_dim=8,
             n_layers=1,
         )
-
-        # Setup two sequences with different lengths
         manager.register_sequence(seq_id=0)
         manager.allocate_slots(seq_id=0, new_num_tokens=8)
         manager.advance_tokens(seq_id=0, num_tokens=8)
@@ -232,11 +219,8 @@ class TestKVCacheManager:
         manager.allocate_slots(seq_id=1, new_num_tokens=4)
         manager.advance_tokens(seq_id=1, num_tokens=4)
 
-        # Build block tables
         block_tables, seq_lens = manager.build_block_tables([0, 1])
-
-        # Verify shapes
-        assert block_tables.shape == (2, 2)  # 2 seqs, max 2 blocks
+        assert block_tables.shape == (2, 2)
         assert seq_lens.shape == (2,)
         assert seq_lens[0] == 8
         assert seq_lens[1] == 4
@@ -247,129 +231,69 @@ class TestPagedAttentionDecode:
 
     def test_output_shape(self, device, seed):
         """Test output shape is correct."""
-        num_seqs = 2
-        num_heads = 4
-        head_dim = 16
-        num_blocks = 8
-        block_size = 4
-        max_blocks_per_seq = 3
-
-        # Create mock inputs
-        q = torch.randn(num_seqs, num_heads, head_dim)
-        key_cache = torch.randn(num_blocks, block_size, num_heads, head_dim)
-        value_cache = torch.randn(num_blocks, block_size, num_heads, head_dim)
-        block_tables = torch.randint(0, num_blocks, (num_seqs, max_blocks_per_seq))
+        q = torch.randn(2, 4, 16)
+        kv_cache = _make_random_kv_cache(8, 4, 4, 16)
+        block_tables = torch.randint(0, 8, (2, 3))
         seq_lens = torch.tensor([10, 6])
 
-        # Run paged attention
-        output = paged_attention_decode(q, key_cache, value_cache, block_tables, seq_lens)
+        output = paged_attention_decode(q, kv_cache, block_tables, seq_lens)
 
-        # Verify shape
-        assert output.shape == (num_seqs, num_heads, head_dim)
+        assert output.shape == (2, 4, 16)
 
     def test_causal_masking(self, device, seed):
-        """Test that causal masking works (future tokens don't affect output)."""
-        num_heads = 2
-        head_dim = 8
-        num_blocks = 4
-        block_size = 4
-
-        # Single sequence
-        q = torch.randn(1, num_heads, head_dim)
-        key_cache = torch.randn(num_blocks, block_size, num_heads, head_dim)
-        value_cache = torch.randn(num_blocks, block_size, num_heads, head_dim)
-
-        # Sequence length 5 (only first 5 tokens should be attended)
+        """Future tokens past ``seq_len`` should not affect output."""
+        q = torch.randn(1, 2, 8)
+        kv_cache = _make_random_kv_cache(4, 4, 2, 8)
         block_tables = torch.tensor([[0, 1, 2, 3]])
         seq_lens = torch.tensor([5])
 
-        output1 = paged_attention_decode(q, key_cache, value_cache, block_tables, seq_lens)
+        output1 = paged_attention_decode(q, kv_cache, block_tables, seq_lens)
 
-        # Modify tokens beyond seq_len (should not affect output)
-        key_cache_modified = key_cache.clone()
-        value_cache_modified = value_cache.clone()
-        key_cache_modified[1, 2:] = torch.randn_like(key_cache_modified[1, 2:])
-        value_cache_modified[1, 2:] = torch.randn_like(value_cache_modified[1, 2:])
+        kv_cache_modified = kv_cache.clone()
+        kv_cache_modified[1, :, 2:] = torch.randn_like(kv_cache_modified[1, :, 2:])
+        output2 = paged_attention_decode(q, kv_cache_modified, block_tables, seq_lens)
 
-        output2 = paged_attention_decode(
-            q, key_cache_modified, value_cache_modified, block_tables, seq_lens
-        )
-
-        # Outputs should be identical (future tokens masked)
         assert torch.allclose(output1, output2, atol=1e-5)
 
     def test_gqa_support(self, device, seed):
-        """Test GQA with num_q_heads > num_kv_heads (Qwen2.5-1.5B: 12:2 ratio)."""
-        num_seqs = 2
-        num_q_heads = 12
-        num_kv_heads = 2
-        head_dim = 128
-        num_blocks = 8
-        block_size = 16
-        max_blocks_per_seq = 3
-
-        # Create inputs with GQA configuration
-        q = torch.randn(num_seqs, num_q_heads, head_dim)
-        key_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_dim)
-        value_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_dim)
-        block_tables = torch.randint(0, num_blocks, (num_seqs, max_blocks_per_seq))
+        """GQA with ``num_q_heads > num_kv_heads`` should still work."""
+        q = torch.randn(2, 12, 128)
+        kv_cache = _make_random_kv_cache(8, 16, 2, 128)
+        block_tables = torch.randint(0, 8, (2, 3))
         seq_lens = torch.tensor([20, 25])
 
-        # Run paged attention with GQA
-        output = paged_attention_decode(q, key_cache, value_cache, block_tables, seq_lens)
+        output = paged_attention_decode(q, kv_cache, block_tables, seq_lens)
 
-        # Verify output shape
-        assert output.shape == (num_seqs, num_q_heads, head_dim)
+        assert output.shape == (2, 12, 128)
 
     def test_mha_backward_compatibility(self, device, seed):
-        """Test MHA (num_q_heads == num_kv_heads) still works correctly."""
-        num_seqs = 2
-        num_heads = 8
-        head_dim = 64
-        num_blocks = 4
-        block_size = 16
-
-        # MHA: same number of Q and KV heads
-        q = torch.randn(num_seqs, num_heads, head_dim)
-        key_cache = torch.randn(num_blocks, block_size, num_heads, head_dim)
-        value_cache = torch.randn(num_blocks, block_size, num_heads, head_dim)
-        block_tables = torch.randint(0, num_blocks, (num_seqs, 2))
+        """MHA should still work when Q and KV head counts match."""
+        q = torch.randn(2, 8, 64)
+        kv_cache = _make_random_kv_cache(4, 16, 8, 64)
+        block_tables = torch.randint(0, 4, (2, 2))
         seq_lens = torch.tensor([15, 20])
 
-        output = paged_attention_decode(q, key_cache, value_cache, block_tables, seq_lens)
+        output = paged_attention_decode(q, kv_cache, block_tables, seq_lens)
 
-        assert output.shape == (num_seqs, num_heads, head_dim)
+        assert output.shape == (2, 8, 64)
 
     def test_bfloat16_cpu_support(self, device, seed):
-        """Test CPU bfloat16 inputs do not fail during decode attention."""
-        num_seqs = 1
-        num_heads = 4
-        head_dim = 16
-        num_blocks = 2
-        block_size = 4
-
-        q = torch.randn(num_seqs, num_heads, head_dim, dtype=torch.bfloat16)
-        key_cache = torch.randn(
-            num_blocks,
-            block_size,
-            num_heads,
-            head_dim,
-            dtype=torch.bfloat16,
-        )
-        value_cache = torch.randn_like(key_cache)
+        """CPU bfloat16 inputs should use the reference backend cleanly."""
+        q = torch.randn(1, 4, 16, dtype=torch.bfloat16)
+        kv_cache = _make_random_kv_cache(2, 4, 4, 16, dtype=torch.bfloat16)
         block_tables = torch.tensor([[0, 1]])
         seq_lens = torch.tensor([6])
 
-        output = paged_attention_decode(q, key_cache, value_cache, block_tables, seq_lens)
+        output = paged_attention_decode(q, kv_cache, block_tables, seq_lens)
 
         assert output.dtype == torch.bfloat16
-        assert output.shape == (num_seqs, num_heads, head_dim)
+        assert output.shape == (1, 4, 16)
 
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_reduced_precision_matches_dense_reference(
         self, dtype: torch.dtype
     ) -> None:
-        """Reduced-precision decode should match dense attention with float32 softmax only."""
+        """Reduced precision should still match dense attention reasonably well."""
         torch.manual_seed(42)
         num_seqs = 1
         num_heads = 4
@@ -379,37 +303,34 @@ class TestPagedAttentionDecode:
         seq_len = 6
 
         q = torch.randn(num_seqs, num_heads, head_dim, dtype=dtype)
-        key_cache = torch.randn(
+        kv_cache = _make_random_kv_cache(
             num_blocks,
             block_size,
             num_heads,
             head_dim,
             dtype=dtype,
         )
-        value_cache = torch.randn_like(key_cache)
         block_tables = torch.tensor([[1, 0]])
         seq_lens = torch.tensor([seq_len])
 
-        output = paged_attention_decode(
-            q, key_cache, value_cache, block_tables, seq_lens
-        )
+        output = paged_attention_decode(q, kv_cache, block_tables, seq_lens)
 
         dense_keys = torch.stack(
             [
-                key_cache[block_tables[0, pos // block_size], pos % block_size]
+                kv_cache[block_tables[0, pos // block_size], 0, pos % block_size]
                 for pos in range(seq_len)
             ],
             dim=0,
         ).unsqueeze(0)
         dense_values = torch.stack(
             [
-                value_cache[block_tables[0, pos // block_size], pos % block_size]
+                kv_cache[block_tables[0, pos // block_size], 1, pos % block_size]
                 for pos in range(seq_len)
             ],
             dim=0,
         ).unsqueeze(0)
         scores = torch.einsum("s h d, s t h d -> s h t", q, dense_keys)
-        scores = (scores * (head_dim ** -0.5)).to(torch.float32)
+        scores = (scores * (head_dim**-0.5)).to(torch.float32)
         attn = torch.softmax(scores, dim=-1).to(dense_values.dtype)
         expected = torch.einsum("s h t, s t h d -> s h d", attn, dense_values)
 
@@ -417,19 +338,47 @@ class TestPagedAttentionDecode:
         torch.testing.assert_close(output, expected, atol=5e-2, rtol=5e-2)
 
     def test_gqa_invalid_ratio(self, device, seed):
-        """Test that invalid GQA ratio raises assertion error."""
-        num_seqs = 1
-        num_q_heads = 7  # Not divisible by num_kv_heads
-        num_kv_heads = 2
-        head_dim = 64
-        num_blocks = 4
-        block_size = 8
-
-        q = torch.randn(num_seqs, num_q_heads, head_dim)
-        key_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_dim)
-        value_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_dim)
+        """Invalid GQA ratios should still raise an assertion."""
+        q = torch.randn(1, 7, 64)
+        kv_cache = _make_random_kv_cache(4, 8, 2, 64)
         block_tables = torch.tensor([[0, 1]])
         seq_lens = torch.tensor([10])
 
-        with pytest.raises(AssertionError, match="num_q_heads must be divisible by num_kv_heads"):
-            paged_attention_decode(q, key_cache, value_cache, block_tables, seq_lens)
+        with pytest.raises(
+            AssertionError, match="num_q_heads must be divisible by num_kv_heads"
+        ):
+            paged_attention_decode(q, kv_cache, block_tables, seq_lens)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton")
+class TestPagedAttentionDecodeTriton:
+    """Test the Triton decode backend against the PyTorch reference."""
+
+    @pytest.mark.parametrize("dtype", [torch.float16])
+    def test_triton_matches_torch_reference(self, dtype: torch.dtype) -> None:
+        """Triton decode should numerically match the reference backend."""
+        from somi_inference.core.paged_attention_triton import TRITON_AVAILABLE
+
+        if not TRITON_AVAILABLE:
+            pytest.skip("Triton is not installed")
+
+        device = torch.device("cuda")
+        torch.manual_seed(42)
+        q = torch.randn(2, 8, 64, device=device, dtype=dtype)
+        kv_cache = _make_random_kv_cache(
+            16,
+            8,
+            2,
+            64,
+            dtype=dtype,
+            device=device,
+        )
+        block_tables = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], device=device)
+        seq_lens = torch.tensor([25, 17], device=device)
+
+        expected = paged_attention_decode_torch_ref(q, kv_cache, block_tables, seq_lens)
+        actual = paged_attention_decode(
+            q, kv_cache, block_tables, seq_lens, backend="triton"
+        )
+
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)

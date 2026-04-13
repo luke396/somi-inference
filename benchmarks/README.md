@@ -31,9 +31,16 @@ uv run python -m benchmarks.bench_engine \
 
 Run the raw kernel microbenchmark:
 
+The `triton` backend is optional and CUDA-only. Install it with
+`uv sync --extra triton` and run `--backend triton` only on a CUDA machine.
+
 ```bash
 uv run python -m benchmarks.bench_paged_attention \
   --batch-sizes 1 4 --seq-lens 512 2048
+uv run python -m benchmarks.bench_paged_attention \
+  --backend torch_ref --batch-sizes 1 4 --seq-lens 128 512
+uv run python -m benchmarks.bench_paged_attention \
+  --backend triton --batch-sizes 1 4 --seq-lens 128 512
 ```
 
 Append results to JSONL:

@@ -10,6 +10,11 @@ dependencies = [
     "transformers>=4.48.0",
 ]
 
+[project.optional-dependencies]
+triton = [
+    "triton>=3.6.0",
+]
+
 [dependency-groups]
 dev = [
     "pre-commit>=4.0.0",

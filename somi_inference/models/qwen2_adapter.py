@@ -88,7 +88,7 @@ class QwenAdapter:
                 cache = kv_manager.kv_caches[layer_idx]
                 q_decode = q.squeeze(2)  # (batch_size, num_heads, head_dim)
                 attn_output = paged_attention_decode(
-                    q_decode, cache.key_cache, cache.value_cache, block_tables, seq_lens
+                    q_decode, cache.kv_cache, block_tables, seq_lens
                 )  # (batch_size, num_heads, head_dim)
                 return attn_output.unsqueeze(2)  # (batch_size, num_heads, 1, head_dim)
 

@@ -1,15 +1,27 @@
-"""Paged attention demo."""
+"""Paged attention core data structures and decode backends."""
+
+from __future__ import annotations
 
 from math import sqrt
+from typing import Literal
 
 import torch
 
+from somi_inference.core.paged_attention_triton import (
+    paged_attention_decode_triton,
+    triton_paged_attention_supported,
+)
+
+PagedAttentionBackend = Literal["auto", "torch_ref", "triton"]
+KV_CACHE_NUM_PLANES = 2
+BLOCK_TABLE_NDIM = 2
+KV_CACHE_NDIM = 5
+QUERY_NDIM = 3
+SINGLE_TOKEN_KV_NDIM = 2
+
 
 class BlockAllocator:
-    """A simple block allocator that manages free blocks and reference counts.
-
-    Just ID management, not holding any data.
-    """
+    """A simple block allocator that manages free blocks and reference counts."""
 
     def __init__(
         self,
@@ -47,7 +59,7 @@ class BlockAllocator:
 
 
 class KVCache:
-    """Hold the actual KV tensors and provide read/write interface."""
+    """Hold the actual KV tensors in a fused vLLM-style layout."""
 
     def __init__(
         self,
@@ -59,40 +71,41 @@ class KVCache:
         device: torch.device | str | None = None,
         dtype: torch.dtype = torch.float32,
     ) -> None:
-        """Initialize the KV cache with pre-allocated space for keys and values."""
-        self.key_cache = torch.zeros(
-            (num_blocks, block_size, num_kv_heads, head_dim),
+        """Initialize the KV cache with pre-allocated fused K/V storage."""
+        # Keep K/V in one fused tensor so the decode backend can pass a single
+        # cache pointer around, which is closer to vLLM's runtime contract.
+        self.kv_cache = torch.zeros(
+            (num_blocks, 2, block_size, num_kv_heads, head_dim),
             device=device,
             dtype=dtype,
         )
-        self.value_cache = torch.zeros(
-            (num_blocks, block_size, num_kv_heads, head_dim),
-            device=device,
-            dtype=dtype,
-        )
-
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+
+    @property
+    def key_cache(self) -> torch.Tensor:
+        """Return a view of the key cache."""
+        return self.kv_cache[:, 0]
+
+    @property
+    def value_cache(self) -> torch.Tensor:
+        """Return a view of the value cache."""
+        return self.kv_cache[:, 1]
 
     def write(
         self, block_id: int, slot: int, key: torch.Tensor, value: torch.Tensor
     ) -> None:
-        """Write key and value tensors of single token to the cache.
-
-        Writes to the specified block and slot.
-        The layout of key and value should be (num_heads, head_dim) for a single token.
-        """
-        assert key.shape == (value.shape) == (self.num_kv_heads, self.head_dim), (
+        """Write key and value tensors of a single token to the cache."""
+        assert key.shape == value.shape == (self.num_kv_heads, self.head_dim), (
             f"Key and value tensors must have shape "
             f"({self.num_kv_heads}, {self.head_dim})"
         )
-        self.key_cache[block_id, slot] = key
-        self.value_cache[block_id, slot] = value
+        self.kv_cache[block_id, 0, slot] = key
+        self.kv_cache[block_id, 1, slot] = value
 
     def copy_block(self, src_block_id: int, dst_block_id: int) -> None:
-        """Copy the entire block of keys and values from source to dest."""
-        self.key_cache[dst_block_id] = self.key_cache[src_block_id]
-        self.value_cache[dst_block_id] = self.value_cache[src_block_id]
+        """Copy the entire fused KV block from source to dest."""
+        self.kv_cache[dst_block_id] = self.kv_cache[src_block_id]
 
 
 class KVCacheManager:
@@ -128,7 +141,7 @@ class KVCacheManager:
                 dtype=self.dtype,
             )
             for _ in range(self.n_layers)
-        ]  # every layer has its own KVCache, block IDs are shared across layers
+        ]
         self.block_size = block_size
         self.seq_to_block: dict[int, list[int]] = {}
         self.seq_to_num_tokens: dict[int, int] = {}
@@ -150,10 +163,7 @@ class KVCacheManager:
         return self.seq_to_num_tokens[seq_id]
 
     def fork_sequence(self, src_seq_id: int, dst_seq_id: int) -> None:
-        """Fork a sequence by copying the block references and token count.
-
-        Increase the reference count for each block to ensure proper memory management.
-        """
+        """Fork a sequence by copying the block references and token count."""
         for block_id in self.seq_to_block[src_seq_id]:
             self.allocator.increase_ref(block_id)
         self.seq_to_block[dst_seq_id] = self.seq_to_block[src_seq_id].copy()
@@ -162,16 +172,14 @@ class KVCacheManager:
     def build_block_tables(
         self, seq_ids: list[int]
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Assemble block_tables and seq_lens tensors for paged_attention_decode.
-
-        This returns block_tables and seq_lens for given sequence IDs,
-        which can be directly used in paged_attention_decode.
-        """
+        """Assemble block_tables and seq_lens tensors for paged attention decode."""
         block_ids_list = [self.get_block_ids(sid) for sid in seq_ids]
         max_blocks = max(len(b) for b in block_ids_list)
         block_tables = torch.zeros(
             len(seq_ids), max_blocks, dtype=torch.long, device=self.device
         )
+        # `seq_lens` is the source of truth at decode time, so zero-padding the
+        # tail of each row is fine as long as callers also pass the true length.
         for i, bids in enumerate(block_ids_list):
             block_tables[i, : len(bids)] = torch.tensor(
                 bids, dtype=torch.long, device=self.device
@@ -191,22 +199,20 @@ class KVCacheManager:
         del self.seq_to_num_tokens[seq_id]
 
     def allocate_slots(self, seq_id: int, new_num_tokens: int) -> None:
-        """Allocate blocks and slots for upcoming tokens, handling COW if needed.
-
-        Not writing kv cahce, not advancing seq_to_num_tokens;
-        just ensure the necessary blocks are allocated and COW-ed if needed.
-        """
+        """Allocate blocks and slots for upcoming tokens, handling COW if needed."""
         current = self.seq_to_num_tokens[seq_id]
-        slot = self.seq_to_num_tokens[seq_id] % self.block_size
         for i in range(new_num_tokens):
             pos = current + i
             slot = pos % self.block_size
             if slot == 0:
+                # Starting a new logical page always needs a fresh physical block.
                 block_id = self.allocator.allocate()
                 self.seq_to_block[seq_id].append(block_id)
-            else:  # slot > 0, need to check COW
+            else:
                 block_id = self.seq_to_block[seq_id][pos // self.block_size]
                 if self.allocator.need_cow(block_id):
+                    # Forked sequences can still share a partially-filled block.
+                    # The first in-place write must break sharing to preserve COW.
                     new_block_id = self.allocator.allocate()
                     for cache in self.kv_caches:
                         cache.copy_block(block_id, new_block_id)
@@ -220,20 +226,10 @@ class KVCacheManager:
         layer_key: torch.Tensor,
         layer_value: torch.Tensor,
     ) -> None:
-        """Write key/value tensors to paged cache for a single layer.
-
-        The layout of k v should be (num_tokens, num_heads, head_dim) or
-        (num_heads, head_dim) for a single token.
-
-        Allocate blocks must have been done by allocate_slots()
-        before calling this function.
-
-        Does NOT advance seq_to_num_tokens; call advance_tokens() after all
-        layers are written.
-        """
-        # (num_heads, head_dim) -> (num_tokens, num_heads, head_dim)
-        dim_single_token = 2
-        if layer_key.dim() == dim_single_token:
+        """Write key/value tensors to paged cache for a single layer."""
+        # Accept both decode's single-token `(num_heads, head_dim)` and
+        # prefill's token-batch `(num_tokens, num_heads, head_dim)` layouts.
+        if layer_key.dim() == SINGLE_TOKEN_KV_NDIM:
             layer_key = layer_key.unsqueeze(0)
             layer_value = layer_value.unsqueeze(0)
         cache = self.kv_caches[layer_idx]
@@ -241,7 +237,6 @@ class KVCacheManager:
         for t, (token_key, token_value) in enumerate(
             zip(layer_key, layer_value, strict=True)
         ):
-            # k v : (num_heads, head_dim)
             pos = base + t
             block_id = self.seq_to_block[seq_id][pos // self.block_size]
             slot = pos % self.block_size
@@ -252,88 +247,151 @@ class KVCacheManager:
         self.seq_to_num_tokens[seq_id] += num_tokens
 
 
-def paged_attention_decode(
-    q: torch.Tensor,  # (num_seqs, num_q_heads, head_dim)
-    key_cache: torch.Tensor,  # (num_blocks, block_size, num_kv_heads, head_dim)
-    value_cache: torch.Tensor,  # (num_blocks, block_size, num_kv_heads, head_dim)
-    block_tables: torch.Tensor,  # (num_seqs, max_blocks_per_seq)
-    seq_lens: torch.Tensor,  # (num_seqs,)
-) -> torch.Tensor:
-    """Compute paged attention decode with online softmax over KV cache blocks.
+def pack_kv_cache(key_cache: torch.Tensor, value_cache: torch.Tensor) -> torch.Tensor:
+    """Pack separate key/value tensors into fused ``kv_cache`` layout."""
+    # This helper is mainly for tests and microbenchmarks. The real runtime
+    # keeps KV fused from the moment it is allocated.
+    if key_cache.shape != value_cache.shape:
+        msg = "key_cache and value_cache must have the same shape"
+        raise ValueError(msg)
+    return torch.stack((key_cache, value_cache), dim=1)
 
-    Precision policy matches ``causal_attention()``:
-    keep ``q @ k`` and the final ``weights @ v`` accumulation in the incoming
-    activation dtype, but maintain the online softmax state in ``float32`` when
-    the inputs are ``float16``/``bfloat16``.
-    """
+
+def _num_queries_per_kv(num_q_heads: int, num_kv_heads: int) -> int:
+    if num_q_heads % num_kv_heads != 0:
+        msg = "num_q_heads must be divisible by num_kv_heads for GQA"
+        raise AssertionError(msg)
+    return num_q_heads // num_kv_heads
+
+
+def _validate_paged_attention_inputs(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+) -> None:
+    if q.dim() != QUERY_NDIM:
+        msg = "q must have shape (num_seqs, num_q_heads, head_dim)"
+        raise ValueError(msg)
+    if kv_cache.dim() != KV_CACHE_NDIM or kv_cache.shape[1] != KV_CACHE_NUM_PLANES:
+        msg = (
+            "kv_cache must have shape "
+            "(num_blocks, 2, block_size, num_kv_heads, head_dim)"
+        )
+        raise ValueError(msg)
+    if block_tables.dim() != BLOCK_TABLE_NDIM:
+        msg = "block_tables must have shape (num_seqs, max_blocks_per_seq)"
+        raise ValueError(msg)
+    if seq_lens.dim() != 1:
+        msg = "seq_lens must have shape (num_seqs,)"
+        raise ValueError(msg)
+    if q.shape[0] != block_tables.shape[0] or q.shape[0] != seq_lens.shape[0]:
+        msg = "q, block_tables, and seq_lens must agree on num_seqs"
+        raise ValueError(msg)
+    if q.shape[-1] != kv_cache.shape[-1]:
+        msg = "q head_dim must match kv_cache head_dim"
+        raise ValueError(msg)
+    if kv_cache.device != q.device or block_tables.device != q.device:
+        msg = "q, kv_cache, and block_tables must be on the same device"
+        raise ValueError(msg)
+    if seq_lens.device != q.device:
+        msg = "seq_lens must be on the same device as q"
+        raise ValueError(msg)
+    _num_queries_per_kv(q.shape[1], kv_cache.shape[3])
+
+
+def paged_attention_decode_torch_ref(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+) -> torch.Tensor:
+    """Compute reference paged decode attention over fused KV cache."""
+    key_cache = kv_cache[:, 0]
+    value_cache = kv_cache[:, 1]
     num_q_heads = q.shape[1]
     num_kv_heads = key_cache.shape[2]
-    # Only the softmax path is promoted; matmuls stay in the incoming dtype.
     softmax_dtype = (
         torch.float32
         if q.dtype in {torch.float16, torch.bfloat16}
         else q.dtype
     )
-    # GQA:repeat KV heads to match Q heads
-    # Simply copy q_heads to match kv_heads, maybe some memory waste
-    if num_q_heads != num_kv_heads:
-        assert num_q_heads % num_kv_heads == 0, (
-            "num_q_heads must be divisible by num_kv_heads for GQA"
-        )
-        repeat_factor = num_q_heads // num_kv_heads
-        # from (num_blocks, block_size, num_kv_heads, head_dim)
-        # to (..., num_q_heads, ...)
-        key_cache = key_cache.repeat_interleave(repeat_factor, dim=2)
-        value_cache = value_cache.repeat_interleave(repeat_factor, dim=2)
-
+    # Keep GQA as an index mapping instead of expanding KV heads up front.
+    q_to_kv_head = torch.arange(num_q_heads, device=q.device) // _num_queries_per_kv(
+        num_q_heads, num_kv_heads
+    )
     scale_factor = 1 / sqrt(q.shape[-1])
     seq_score_max = torch.full(
         (q.shape[0], q.shape[1]),
         -torch.inf,
         device=q.device,
         dtype=softmax_dtype,
-    )  # (num_seqs, num_heads)
-    output = torch.zeros_like(q)  # (num_seqs, num_heads, head_dim)
-    running_sum = torch.zeros_like(seq_score_max)  # (num_seqs, num_heads)
+    )
+    output = torch.zeros_like(q)
+    running_sum = torch.zeros_like(seq_score_max)
     max_blocks_per_seq = block_tables.shape[1]
     block_size = key_cache.shape[1]
-
-    block_offsets = torch.arange(block_size, device=q.device)  # (block_size,)
+    block_offsets = torch.arange(block_size, device=q.device)
 
     for block_n in range(max_blocks_per_seq):
-        token_position = block_n * block_size + block_offsets  # (block_size,)
-        invalid_position_msk = token_position.unsqueeze(0) >= seq_lens.unsqueeze(
-            1
-        )  # (num_seqs, block_size)
-        block_ids = block_tables[:, block_n]  # (num_seqs,)
-        key_block = key_cache[block_ids]
-        value_block = value_cache[block_ids]
+        token_position = block_n * block_size + block_offsets
+        invalid_position_msk = token_position.unsqueeze(0) >= seq_lens.unsqueeze(1)
+        block_ids = block_tables[:, block_n]
+        # The reference path still gathers dense per-block tensors. This keeps
+        # the implementation easy to read, and gives us a correctness oracle
+        # for the Triton kernel, but it is exactly the extra materialization
+        # that the custom kernel is meant to avoid on the hot path.
+        key_block = key_cache[block_ids].index_select(dim=2, index=q_to_kv_head)
+        value_block = value_cache[block_ids].index_select(dim=2, index=q_to_kv_head)
         scores = (
-            torch.einsum("s h d, s b h d -> s h b", q, key_block)
-            * scale_factor
-        ).to(softmax_dtype)  # (num_seqs, num_heads, block_size)
+            torch.einsum("s h d, s b h d -> s h b", q, key_block) * scale_factor
+        ).to(softmax_dtype)
         scores = scores.masked_fill(invalid_position_msk.unsqueeze(1), -torch.inf)
 
-        block_max = scores.max(dim=-1)  # (num_seqs, num_heads)
-        running_max = torch.maximum(
-            seq_score_max, block_max.values
-        )  # (num_seqs, num_heads)
-        correction = torch.exp(seq_score_max - running_max)  # (num_seqs, num_heads)
-        output *= correction.unsqueeze(-1).to(
-            output.dtype
-        )  # (num_seqs, num_heads, head_dim)
-        running_sum *= correction  # (num_seqs, num_heads)
-        weights = torch.exp(
-            scores - running_max.unsqueeze(-1)
-        )  # (num_seqs, num_heads, block_size)
+        block_max = scores.max(dim=-1)
+        running_max = torch.maximum(seq_score_max, block_max.values)
+        correction = torch.exp(seq_score_max - running_max)
+        output *= correction.unsqueeze(-1).to(output.dtype)
+        running_sum *= correction
+        weights = torch.exp(scores - running_max.unsqueeze(-1))
         output += torch.einsum(
             "s h b, s b h d -> s h d", weights.to(value_block.dtype), value_block
-        )  # (num_seqs, num_heads, head_dim)
-        running_sum += weights.sum(dim=-1)  # (num_seqs, num_heads)
+        )
+        running_sum += weights.sum(dim=-1)
         seq_score_max = running_max
 
-    output /= running_sum.unsqueeze(-1).to(
-        output.dtype
-    )  # (num_seqs, num_heads, head_dim)
-
+    output /= running_sum.unsqueeze(-1).to(output.dtype)
     return output
+
+
+def paged_attention_decode(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    backend: PagedAttentionBackend = "auto",
+) -> torch.Tensor:
+    """Compute decode attention over paged KV cache.
+
+    ``backend="auto"`` prefers Triton on supported CUDA inputs and otherwise
+    falls back to the PyTorch reference path.
+    """
+    # Validate once at the public entry point; the backend helpers assume the
+    # basic shape/device contract already holds.
+    _validate_paged_attention_inputs(q, kv_cache, block_tables, seq_lens)
+    if backend not in {"auto", "torch_ref", "triton"}:
+        msg = f"Unsupported paged attention backend: {backend}"
+        raise ValueError(msg)
+    if backend == "torch_ref":
+        return paged_attention_decode_torch_ref(q, kv_cache, block_tables, seq_lens)
+    if backend == "triton":
+        if not triton_paged_attention_supported(q, kv_cache, block_tables, seq_lens):
+            msg = "Triton paged attention backend is not available for these inputs"
+            raise RuntimeError(msg)
+        return paged_attention_decode_triton(q, kv_cache, block_tables, seq_lens)
+    # `auto` keeps CPU and unsupported CUDA shapes on the simple reference path,
+    # but lets the real decode hot path transparently use the Triton backend.
+    if triton_paged_attention_supported(q, kv_cache, block_tables, seq_lens):
+        return paged_attention_decode_triton(q, kv_cache, block_tables, seq_lens)
+    return paged_attention_decode_torch_ref(q, kv_cache, block_tables, seq_lens)
