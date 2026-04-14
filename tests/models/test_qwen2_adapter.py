@@ -55,6 +55,23 @@ class TestQwenAdapterPrefill:
         assert kv.get_num_tokens(0) == 5
         assert len(kv.get_block_ids(0)) == 2  # 5 tokens / block_size=4 → 2 blocks
 
+    def test_prefill_backend_setting_keeps_cpu_outputs_identical(self):
+        """CPU auto dispatch should match the explicit torch_ref prefill path."""
+        torch.manual_seed(42)
+        model = QwenModel(**ADAPTER_CONFIG)
+        auto_adapter = QwenAdapter(model, prefill_attention_backend="auto")
+        ref_adapter = QwenAdapter(model, prefill_attention_backend="torch_ref")
+        auto_kv = _make_kv_manager()
+        ref_kv = _make_kv_manager()
+        auto_kv.register_sequence(0)
+        ref_kv.register_sequence(0)
+
+        tokens = torch.randint(0, 100, (1, 6))
+        auto_logits = auto_adapter.prefill(tokens, auto_kv, seq_id=0)
+        ref_logits = ref_adapter.prefill(tokens, ref_kv, seq_id=0)
+
+        torch.testing.assert_close(auto_logits, ref_logits)
+
 
 class TestQwenAdapterDecode:
     def test_decode_logits_shape(self):

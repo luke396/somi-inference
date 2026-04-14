@@ -3,9 +3,18 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
+from typing import Literal
 
 import torch
 from torch import nn
+
+from somi_inference.core.flash_attention_triton import (
+    causal_attention_triton,
+    triton_causal_attention_supported,
+)
+
+PrefillAttentionBackend = Literal["auto", "torch_ref", "triton"]
+CAUSAL_ATTENTION_NDIM = 4
 
 
 class ForwardMode(Enum):
@@ -97,7 +106,49 @@ def apply_rotary_pos_emb(
     return q_embed, k_embed
 
 
-def causal_attention(
+def _num_queries_per_kv(num_q_heads: int, num_kv_heads: int) -> int:
+    if num_q_heads % num_kv_heads != 0:
+        msg = (
+            f"num_q_heads ({num_q_heads}) must be "
+            f"divisible by num_kv_heads ({num_kv_heads})"
+        )
+        raise ValueError(msg)
+    return num_q_heads // num_kv_heads
+
+
+def _validate_causal_attention_inputs(
+    q: torch.Tensor,  # (batch_size, num_q_heads, seq_len, head_dim)
+    k: torch.Tensor,  # (batch_size, num_kv_heads, seq_len, head_dim)
+    v: torch.Tensor,  # (batch_size, num_kv_heads, seq_len, head_dim)
+) -> None:
+    if q.dim() != CAUSAL_ATTENTION_NDIM:
+        msg = "q must have shape (batch_size, num_q_heads, seq_len, head_dim)"
+        raise ValueError(msg)
+    if k.dim() != CAUSAL_ATTENTION_NDIM:
+        msg = "k must have shape (batch_size, num_kv_heads, seq_len, head_dim)"
+        raise ValueError(msg)
+    if v.dim() != CAUSAL_ATTENTION_NDIM:
+        msg = "v must have shape (batch_size, num_kv_heads, seq_len, head_dim)"
+        raise ValueError(msg)
+    if q.shape[0] != k.shape[0] or q.shape[0] != v.shape[0]:
+        msg = "q, k, and v must agree on batch_size"
+        raise ValueError(msg)
+    if q.shape[2] != k.shape[2] or q.shape[2] != v.shape[2]:
+        msg = "q, k, and v must agree on seq_len"
+        raise ValueError(msg)
+    if q.shape[3] != k.shape[3] or q.shape[3] != v.shape[3]:
+        msg = "q, k, and v must agree on head_dim"
+        raise ValueError(msg)
+    if k.shape[1] != v.shape[1]:
+        msg = "k and v must agree on num_kv_heads"
+        raise ValueError(msg)
+    if q.device != k.device or q.device != v.device:
+        msg = "q, k, and v must be on the same device"
+        raise ValueError(msg)
+    _num_queries_per_kv(q.shape[1], k.shape[1])
+
+
+def causal_attention_torch_ref(
     q: torch.Tensor,  # (batch_size, num_q_heads, seq_len, head_dim)
     k: torch.Tensor,  # (batch_size, num_kv_heads, seq_len, head_dim)
     v: torch.Tensor,  # (batch_size, num_kv_heads, seq_len, head_dim)
@@ -108,16 +159,11 @@ def causal_attention(
     keep ``q @ k`` and ``attn @ v`` in the incoming activation dtype, but run
     the softmax logits/probabilities in ``float32`` for numerical stability.
     """
+    _validate_causal_attention_inputs(q, k, v)
     num_q_heads = q.shape[1]
     num_kv_heads = k.shape[1]
-    if num_q_heads % num_kv_heads != 0:
-        msg = (
-            f"num_q_heads ({num_q_heads}) must be "
-            f"divisible by num_kv_heads ({num_kv_heads})"
-        )
-        raise ValueError(msg)
     if num_q_heads != num_kv_heads:
-        repeat_factor = num_q_heads // num_kv_heads
+        repeat_factor = _num_queries_per_kv(num_q_heads, num_kv_heads)
         k = k.repeat_interleave(repeat_factor, dim=1)
         v = v.repeat_interleave(repeat_factor, dim=1)
 
@@ -131,6 +177,30 @@ def causal_attention(
     # Softmax stays in float32, then cast weights back before the value matmul.
     attn = torch.softmax(scores, dim=-1, dtype=torch.float32).to(v.dtype)
     return torch.einsum("bhij,bhjd->bhid", attn, v)
+
+
+def causal_attention(
+    q: torch.Tensor,  # (batch_size, num_q_heads, seq_len, head_dim)
+    k: torch.Tensor,  # (batch_size, num_kv_heads, seq_len, head_dim)
+    v: torch.Tensor,  # (batch_size, num_kv_heads, seq_len, head_dim)
+    *,
+    backend: PrefillAttentionBackend = "auto",
+) -> torch.Tensor:
+    """Compute prefill causal attention with automatic backend dispatch."""
+    _validate_causal_attention_inputs(q, k, v)
+    if backend not in {"auto", "torch_ref", "triton"}:
+        msg = f"Unsupported causal attention backend: {backend}"
+        raise ValueError(msg)
+    if backend == "torch_ref":
+        return causal_attention_torch_ref(q, k, v)
+    if backend == "triton":
+        if not triton_causal_attention_supported(q, k, v):
+            msg = "Triton causal attention backend is not available for these inputs"
+            raise RuntimeError(msg)
+        return causal_attention_triton(q, k, v)
+    if triton_causal_attention_supported(q, k, v):
+        return causal_attention_triton(q, k, v)
+    return causal_attention_torch_ref(q, k, v)
 
 
 class QwenMLP(nn.Module):

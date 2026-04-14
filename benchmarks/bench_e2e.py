@@ -67,6 +67,16 @@ def parse_args() -> argparse.Namespace:
         help="Model / cache dtype. 'auto' picks a device-appropriate default.",
     )
     parser.add_argument(
+        "--attention-backend",
+        type=str,
+        default="auto",
+        choices=["auto", "torch_ref", "triton"],
+        help=(
+            "Prefill attention backend. "
+            "'auto' prefers Triton on supported CUDA inputs."
+        ),
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -144,6 +154,7 @@ def main() -> None:
         max_concurrent=args.max_concurrent,
         device=device,
         dtype=dtype,
+        prefill_attention_backend=args.attention_backend,
     )
     prompt_token_count = len(llm.tokenizer.encode(args.prompt))
 
@@ -212,6 +223,7 @@ def main() -> None:
             "repetition_penalty": args.repetition_penalty,
             "device": str(device),
             "dtype": str(dtype),
+            "attention_backend": args.attention_backend,
             "warmup_iters": args.warmup_iters,
             "measure_iters": args.measure_iters,
         },

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import torch
 
@@ -24,6 +24,13 @@ from somi_inference.tokenizer import Tokenizer
 
 DEFAULT_BLOCK_SIZE = 16
 DEFAULT_MAX_CONCURRENT = 16
+PrefillAttentionBackend = Literal["auto", "torch_ref", "triton"]
+
+
+class PrefillConfigurableAdapter(Protocol):
+    """Adapter contract for selecting the prefill attention backend."""
+
+    prefill_attention_backend: PrefillAttentionBackend
 
 
 def _require_int(config: dict[str, object], key: str) -> int:
@@ -44,6 +51,7 @@ class LLM:
         max_concurrent: int = DEFAULT_MAX_CONCURRENT,
         device: torch.device | str | None = None,
         dtype: torch.dtype = torch.float32,
+        prefill_attention_backend: PrefillAttentionBackend = "auto",
     ) -> None:
         """Initialize tokenizer, model, KV cache, scheduler, and engine."""
         self.device = torch.device(device) if device is not None else torch.device(
@@ -52,6 +60,9 @@ class LLM:
         self.dtype = dtype
         self.tokenizer = Tokenizer(model_name)
         adapter, config = load_model(model_name)
+        if hasattr(adapter, "prefill_attention_backend"):
+            configurable_adapter = cast("PrefillConfigurableAdapter", adapter)
+            configurable_adapter.prefill_attention_backend = prefill_attention_backend
         model = getattr(adapter, "model", None)
         if isinstance(model, torch.nn.Module):
             model.to(device=self.device, dtype=self.dtype)

@@ -9,6 +9,7 @@ from somi_inference.models.qwen2 import (
     RotaryEmbedding,
     apply_rotary_pos_emb,
     causal_attention,
+    causal_attention_torch_ref,
     rotate_half,
 )
 
@@ -238,6 +239,56 @@ class TestCausalAttention:
         assert out.shape == (1, 4, 8, 16)
         assert out.dtype == dtype
         assert torch.isfinite(out.float()).all()
+
+    def test_auto_backend_matches_torch_ref_on_cpu(self):
+        """CPU auto-dispatch should fall back to the reference implementation."""
+        torch.manual_seed(42)
+        q = torch.randn(2, 4, 7, 16)
+        k = torch.randn(2, 2, 7, 16)
+        v = torch.randn(2, 2, 7, 16)
+
+        expected = causal_attention_torch_ref(q, k, v)
+        actual = causal_attention(q, k, v, backend="auto")
+
+        torch.testing.assert_close(actual, expected)
+
+    def test_invalid_backend(self):
+        """Unsupported backend names should raise ValueError."""
+        q = torch.randn(1, 2, 4, 8)
+        k = torch.randn(1, 2, 4, 8)
+        v = torch.randn(1, 2, 4, 8)
+
+        with pytest.raises(ValueError, match="Unsupported causal attention backend"):
+            causal_attention(q, k, v, backend="bad-backend")  # type: ignore[arg-type]
+
+    def test_triton_backend_rejects_unsupported_cpu_inputs(self):
+        """Forcing Triton on unsupported inputs should raise a runtime error."""
+        q = torch.randn(1, 2, 4, 8)
+        k = torch.randn(1, 2, 4, 8)
+        v = torch.randn(1, 2, 4, 8)
+
+        with pytest.raises(RuntimeError, match="not available"):
+            causal_attention(q, k, v, backend="triton")
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(),
+        reason="Triton prefill parity requires CUDA",
+    )
+    def test_triton_matches_torch_ref(self):
+        """Supported CUDA inputs should match the reference path."""
+        torch.manual_seed(42)
+        device = torch.device("cuda")
+        dtype = (
+            torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        )
+        q = torch.randn(1, 4, 65, 64, device=device, dtype=dtype)
+        k = torch.randn(1, 2, 65, 64, device=device, dtype=dtype)
+        v = torch.randn(1, 2, 65, 64, device=device, dtype=dtype)
+
+        expected = causal_attention_torch_ref(q, k, v)
+        actual = causal_attention(q, k, v, backend="triton")
+
+        torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("num_q_heads,num_kv_heads", [

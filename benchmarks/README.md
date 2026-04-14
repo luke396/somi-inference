@@ -9,6 +9,7 @@ The structure follows the same high-level split used by `vLLM` and `SGLang`:
 - `bench_paged_attention.py`: raw `paged_attention_decode()` microbenchmark
 - `bench_engine.py`: continuous batching engine throughput with synthetic arrivals
 - `bench_e2e.py`: single-request `LLM.generate()` TTFT / end-to-end tok/s
+- `profile_prefill.py`: semantic prefill stage profiler (`project_qkv` / attention / `write_kv` / `mlp` / `lm_head`)
 
 ## Usage
 
@@ -43,6 +44,17 @@ uv run python -m benchmarks.bench_paged_attention \
   --backend triton --batch-sizes 1 4 --seq-lens 128 512
 ```
 
+Run the semantic prefill profiler before tuning kernels or cache writes:
+
+```bash
+uv run python -m benchmarks.profile_prefill \
+  --model-name Qwen/Qwen2.5-0.5B \
+  --device cuda \
+  --dtype float16 \
+  --attention-backends torch_ref triton \
+  --synthetic-prompt-len 512
+```
+
 Append results to JSONL:
 
 ```bash
@@ -63,6 +75,7 @@ MODE=server scripts/run_cuda_benchmarks.sh
 - `--model-name` uses the existing HF loader and then moves the model to the chosen `--device` / `--dtype`.
 - `bench_decode.py` rebuilds KV state before each timed iteration, so it measures one decode step at a fixed context length and excludes prefill time.
 - `bench_e2e.py` exercises the public `LLM.generate()` path, including tokenization, scheduling, sampling, and decode.
+- `profile_prefill.py` is for attribution, not acceptance: use it to find the current bottleneck before optimization, then use `bench_prefill.py` / `bench_e2e.py` to verify gains.
 - JSONL payloads now include an `environment` object with `git_sha`, `git_dirty`, Python / PyTorch versions, and the resolved device name.
 - `bench_engine.py` benchmarks the current in-process scheduler / engine path, not an HTTP serving stack.
 - `scripts/run_cuda_benchmarks.sh` defaults to a lighter `MODE=local` preset for small GPUs and uses `MODE=server` for the fuller sweep.

@@ -11,6 +11,7 @@ from somi_inference.core.paged_attention import KVCacheManager, paged_attention_
 from somi_inference.models.qwen2 import (
     ForwardContext,
     ForwardMode,
+    PrefillAttentionBackend,
     QwenModel,
     causal_attention,
 )
@@ -22,9 +23,15 @@ AttnFn = Callable[[torch.Tensor, torch.Tensor, torch.Tensor, int], torch.Tensor]
 class QwenAdapter:
     """Adapter bridging QwenModel with KV cache management for inference."""
 
-    def __init__(self, model: QwenModel) -> None:
+    def __init__(
+        self,
+        model: QwenModel,
+        *,
+        prefill_attention_backend: PrefillAttentionBackend = "auto",
+    ) -> None:
         """Initialize adapter with a QwenModel instance."""
         self.model = model
+        self.prefill_attention_backend = prefill_attention_backend
 
     def _lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project hidden states to vocab logits using tied embedding weights."""
@@ -48,7 +55,7 @@ class QwenAdapter:
                 k_write = k.squeeze(0).transpose(0, 1)  # (seq_len, num_heads, head_dim)
                 v_write = v.squeeze(0).transpose(0, 1)  # (seq_len, num_heads, head_dim)
                 kv_manager.write_kv(seq_id, layer_idx, k_write, v_write)
-                return causal_attention(q, k, v)
+                return causal_attention(q, k, v, backend=self.prefill_attention_backend)
 
             return attn_fn
 

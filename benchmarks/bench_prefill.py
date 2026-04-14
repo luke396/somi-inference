@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
 
@@ -24,6 +24,20 @@ from benchmarks.common import (
 
 if TYPE_CHECKING:
     from somi_inference.core.paged_attention import KVCacheManager
+
+
+class PrefillBenchmarkAdapter(Protocol):
+    """Benchmark adapter contract for selecting the prefill attention backend."""
+
+    prefill_attention_backend: str
+
+    def prefill(
+        self,
+        input_ids: torch.Tensor,
+        kv_manager: KVCacheManager,
+        seq_id: int,
+    ) -> torch.Tensor:
+        """Run one prefill pass and return logits."""
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,6 +88,16 @@ def parse_args() -> argparse.Namespace:
         help="Number of timed iterations.",
     )
     parser.add_argument(
+        "--attention-backend",
+        type=str,
+        default="auto",
+        choices=["auto", "torch_ref", "triton"],
+        help=(
+            "Prefill attention backend. "
+            "'auto' prefers Triton on supported CUDA inputs."
+        ),
+    )
+    parser.add_argument(
         "--output-file",
         type=str,
         default=None,
@@ -96,6 +120,14 @@ def main() -> None:
     dtype = resolve_dtype(args.dtype, device)
     seed_everything(args.seed)
     adapter, config = load_benchmark_adapter(args.model_name, device, dtype)
+    if not hasattr(adapter, "prefill_attention_backend"):
+        message = (
+            "Prefill benchmark requires an adapter with a "
+            "`prefill_attention_backend` attribute."
+        )
+        raise TypeError(message)
+    benchmark_adapter = cast("PrefillBenchmarkAdapter", adapter)
+    benchmark_adapter.prefill_attention_backend = args.attention_backend
     environment = collect_environment_metadata(device)
 
     for prompt_len in args.prompt_lens:
@@ -130,7 +162,7 @@ def main() -> None:
             next_seq_id += 1
             cache_manager.register_sequence(seq_id)
             with torch.inference_mode():
-                logits = adapter.prefill(prompt_ids, cache_manager, seq_id)
+                logits = benchmark_adapter.prefill(prompt_ids, cache_manager, seq_id)
             cache_manager.free_sequence(seq_id)
             return logits[:, -1, :]
 
@@ -152,6 +184,7 @@ def main() -> None:
                 "block_size": args.block_size,
                 "device": str(device),
                 "dtype": str(dtype),
+                "attention_backend": args.attention_backend,
                 "warmup_iters": args.warmup_iters,
                 "measure_iters": args.measure_iters,
             },
