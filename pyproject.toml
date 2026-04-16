@@ -57,6 +57,7 @@ markers = [
 [tool.ruff]
 line-length = 88
 extend-exclude = ["tests", "scripts"]
+force-exclude = true
 
 [tool.ruff.lint]
 select = ["ALL"]
