@@ -78,7 +78,7 @@ class FixedContextDecodeBenchmark:
                 self.kv_manager.register_sequence(seq_id)
                 logits = self.adapter.prefill(prompt, self.kv_manager, seq_id)
                 token_inputs.append(
-                    torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+                    torch.argmax(logits[:, 0, :], dim=-1, keepdim=True)
                 )
         self.input_ids = torch.cat(token_inputs, dim=0)
 

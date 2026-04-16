@@ -82,16 +82,14 @@ def kv_manager() -> KVCacheManager:
     )
 
 
-def test_model_runner_prefill_samples_last_prompt_position(
+def test_model_runner_prefill_samples_single_prefill_step(
     kv_manager: KVCacheManager,
 ) -> None:
-    """Prefill should sample from the last prompt position."""
+    """Prefill should sample from the single returned prefill step."""
     prefill_logits = torch.tensor(
         [
             [
                 [0.0, 1.0, 2.0],
-                [3.0, 4.0, 5.0],
-                [6.0, 7.0, 8.0],
             ]
         ]
     )
@@ -120,7 +118,7 @@ def test_model_runner_prefill_samples_last_prompt_position(
 
     assert len(sampler.calls) == 1
     sampler_logits, sampler_params, token_histories = sampler.calls[0]
-    torch.testing.assert_close(sampler_logits, prefill_logits[:, -1, :])
+    torch.testing.assert_close(sampler_logits, prefill_logits[:, 0, :])
     assert sampler_params is params
     assert token_histories == [[11, 12, 13]]
 

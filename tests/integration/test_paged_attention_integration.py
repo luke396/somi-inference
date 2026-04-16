@@ -48,7 +48,7 @@ class TestPagedAttentionIntegration:
         prefill_logits = small_adapter.prefill(prompt, kv_manager, seq_id=0)
 
         # Decode should use paged attention
-        next_token = prefill_logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        next_token = prefill_logits[:, 0, :].argmax(dim=-1, keepdim=True)
         decode_logits = small_adapter.decode(next_token, kv_manager, seq_ids=[0])
 
         # Verify KV cache was used
