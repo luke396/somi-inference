@@ -18,6 +18,7 @@ BLOCK_TABLE_NDIM = 2
 KV_CACHE_NDIM = 5
 QUERY_NDIM = 3
 SINGLE_TOKEN_KV_NDIM = 2
+PREFILL_TOKEN_BATCH_NDIM = 3
 
 
 class BlockAllocator:
@@ -227,20 +228,68 @@ class KVCacheManager:
         layer_value: torch.Tensor,
     ) -> None:
         """Write key/value tensors to paged cache for a single layer."""
-        # Accept both decode's single-token `(num_heads, head_dim)` and
-        # prefill's token-batch `(num_tokens, num_heads, head_dim)` layouts.
-        if layer_key.dim() == SINGLE_TOKEN_KV_NDIM:
-            layer_key = layer_key.unsqueeze(0)
-            layer_value = layer_value.unsqueeze(0)
         cache = self.kv_caches[layer_idx]
+        if layer_key.shape != layer_value.shape:
+            msg = "layer_key and layer_value must have the same shape"
+            raise ValueError(msg)
+        if layer_key.dim() == SINGLE_TOKEN_KV_NDIM:
+            self._write_kv_single(seq_id, cache, layer_key, layer_value)
+            return
+        if layer_key.dim() != PREFILL_TOKEN_BATCH_NDIM:
+            msg = (
+                "layer_key and layer_value must have shape "
+                "(num_kv_heads, head_dim) or (num_tokens, num_kv_heads, head_dim)"
+            )
+            raise ValueError(msg)
+        self._write_kv_prefill(seq_id, cache, layer_key, layer_value)
+
+    def _write_kv_single(
+        self,
+        seq_id: int,
+        cache: KVCache,
+        layer_key: torch.Tensor,
+        layer_value: torch.Tensor,
+    ) -> None:
+        """Write one token of KV data for decode."""
+        pos = self.seq_to_num_tokens[seq_id]
+        block_id = self.seq_to_block[seq_id][pos // self.block_size]
+        slot = pos % self.block_size
+        cache.write(block_id, slot, layer_key, layer_value)
+
+    def _write_kv_prefill(
+        self,
+        seq_id: int,
+        cache: KVCache,
+        layer_key: torch.Tensor,
+        layer_value: torch.Tensor,
+    ) -> None:
+        """Write a prefill token batch with block-wise slice assignments."""
         base = self.seq_to_num_tokens[seq_id]
-        for t, (token_key, token_value) in enumerate(
-            zip(layer_key, layer_value, strict=True)
-        ):
-            pos = base + t
-            block_id = self.seq_to_block[seq_id][pos // self.block_size]
-            slot = pos % self.block_size
-            cache.write(block_id, slot, token_key, token_value)
+        token_offset = 0
+        pos = base
+        num_tokens = layer_key.shape[0]
+        block_ids = self.seq_to_block[seq_id]
+
+        while token_offset < num_tokens:
+            block_index = pos // self.block_size
+            block_id = block_ids[block_index]
+            start_slot = pos % self.block_size
+            tokens_in_block = min(
+                self.block_size - start_slot,
+                num_tokens - token_offset,
+            )
+            end_slot = start_slot + tokens_in_block
+            token_end = token_offset + tokens_in_block
+
+            cache.key_cache[block_id, start_slot:end_slot] = layer_key[
+                token_offset:token_end
+            ]
+            cache.value_cache[block_id, start_slot:end_slot] = layer_value[
+                token_offset:token_end
+            ]
+
+            token_offset = token_end
+            pos += tokens_in_block
 
     def advance_tokens(self, seq_id: int, num_tokens: int) -> None:
         """Advance token count after writing KV for multiple layers."""
