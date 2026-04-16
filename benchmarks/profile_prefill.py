@@ -51,6 +51,14 @@ PRIMARY_STAGE_LABELS = (
     "mlp",
     "lm_head",
 )
+PRIMARY_STAGE_LABELS_WITH_SPLIT_MLP = (
+    "project_qkv",
+    "write_kv",
+    "mlp_gate_up_proj",
+    "mlp_silu_mul",
+    "mlp_down_proj",
+    "lm_head",
+)
 
 
 @dataclass
@@ -137,6 +145,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Use a random synthetic prompt with this many tokens instead.",
     )
+    parser.add_argument(
+        "--split-mlp",
+        action="store_true",
+        help="Split the MLP bucket into gate/up/activation*mul/down stages.",
+    )
     return parser.parse_args()
 
 
@@ -202,10 +215,12 @@ def _event_time_ms(event: object | None, attr_name: str) -> float:
 
 
 @contextmanager
-def _install_stage_hooks() -> Iterator[None]:
+def _install_stage_hooks(*, split_mlp: bool = False) -> Iterator[None]:
     original_attention_forward = QwenAttention.forward
     original_project_qkv = QwenAttention._project_qkv  # noqa: SLF001
     original_mlp_forward = QwenMLP.forward
+    original_mlp_gate_up_proj = QwenMLP._gate_up_proj  # noqa: SLF001
+    original_mlp_down_proj = QwenMLP._down_proj  # noqa: SLF001
     original_lm_head = QwenAdapter._lm_head  # noqa: SLF001
     original_write_kv = KVCacheManager.write_kv
     original_causal_attention = qwen2_adapter_module.causal_attention
@@ -230,8 +245,16 @@ def _install_stage_hooks() -> Iterator[None]:
             return original_project_qkv(self, hidden_states, cos, sin)
 
     def wrapped_mlp_forward(self: QwenMLP, x: torch.Tensor) -> torch.Tensor:
-        with record_function(f"{STAGE_PREFIX}mlp"):
-            return original_mlp_forward(self, x)
+        if not split_mlp:
+            with record_function(f"{STAGE_PREFIX}mlp"):
+                return original_mlp_forward(self, x)
+
+        with record_function(f"{STAGE_PREFIX}mlp_gate_up_proj"):
+            gate, up = original_mlp_gate_up_proj(self, x).chunk(2, dim=-1)
+        with record_function(f"{STAGE_PREFIX}mlp_silu_mul"):
+            fused = self.act(gate) * up
+        with record_function(f"{STAGE_PREFIX}mlp_down_proj"):
+            return original_mlp_down_proj(self, fused)
 
     def wrapped_lm_head(
         self: QwenAdapter, hidden_states: torch.Tensor
@@ -300,6 +323,7 @@ def _summarize_profile(
     requested_backend: PrefillAttentionBackend,
     prompt_len: int,
     device: torch.device,
+    stage_labels: tuple[str, ...],
 ) -> ProfileResult:
     time_attr = _time_attr(device)
     by_key = {event.key: event for event in profiler.key_averages()}
@@ -322,7 +346,7 @@ def _summarize_profile(
     stage_timings: list[StageTiming] = []
     tracked_time_ms = 0.0
 
-    for label in PRIMARY_STAGE_LABELS:
+    for label in stage_labels:
         stage_label = f"{STAGE_PREFIX}{label}"
         stage_time_ms = _event_time_ms(by_key.get(stage_label), time_attr)
         tracked_time_ms += stage_time_ms
@@ -380,6 +404,7 @@ def _profile_backend(
     device: torch.device,
     dtype: torch.dtype,
     warmup_iters: int,
+    split_mlp: bool = False,
 ) -> ProfileResult:
     num_blocks = required_blocks(input_ids.size(1), block_size) + 1
     kv_manager = create_kv_manager(
@@ -394,7 +419,11 @@ def _profile_backend(
     if device.type == "cuda":
         activities.append(ProfilerActivity.CUDA)
 
-    with _install_stage_hooks():
+    stage_labels = (
+        PRIMARY_STAGE_LABELS_WITH_SPLIT_MLP if split_mlp else PRIMARY_STAGE_LABELS
+    )
+
+    with _install_stage_hooks(split_mlp=split_mlp):
         for seq_id in range(warmup_iters):
             synchronize(device)
             _run_prefill_once(adapter, kv_manager, input_ids, seq_id)
@@ -414,6 +443,7 @@ def _profile_backend(
         requested_backend=backend,
         prompt_len=input_ids.size(1),
         device=device,
+        stage_labels=stage_labels,
     )
 
 
@@ -495,6 +525,7 @@ def main() -> None:
             device=device,
             dtype=dtype,
             warmup_iters=args.warmup_iters,
+            split_mlp=args.split_mlp,
         )
         _print_result(result)
 

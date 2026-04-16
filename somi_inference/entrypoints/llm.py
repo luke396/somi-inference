@@ -25,12 +25,19 @@ from somi_inference.tokenizer import Tokenizer
 DEFAULT_BLOCK_SIZE = 16
 DEFAULT_MAX_CONCURRENT = 16
 PrefillAttentionBackend = Literal["auto", "torch_ref", "triton"]
+MLPBackend = Literal["auto", "torch_ref", "triton"]
 
 
 class PrefillConfigurableAdapter(Protocol):
     """Adapter contract for selecting the prefill attention backend."""
 
     prefill_attention_backend: PrefillAttentionBackend
+
+
+class MLPConfigurableAdapter(Protocol):
+    """Adapter contract for selecting the MLP backend."""
+
+    mlp_backend: MLPBackend
 
 
 def _require_int(config: dict[str, object], key: str) -> int:
@@ -52,6 +59,7 @@ class LLM:
         device: torch.device | str | None = None,
         dtype: torch.dtype = torch.float32,
         prefill_attention_backend: PrefillAttentionBackend = "auto",
+        mlp_backend: MLPBackend = "auto",
     ) -> None:
         """Initialize tokenizer, model, KV cache, scheduler, and engine."""
         self.device = torch.device(device) if device is not None else torch.device(
@@ -63,6 +71,9 @@ class LLM:
         if hasattr(adapter, "prefill_attention_backend"):
             configurable_adapter = cast("PrefillConfigurableAdapter", adapter)
             configurable_adapter.prefill_attention_backend = prefill_attention_backend
+        if hasattr(adapter, "mlp_backend"):
+            configurable_adapter = cast("MLPConfigurableAdapter", adapter)
+            configurable_adapter.mlp_backend = mlp_backend
         model = getattr(adapter, "model", None)
         if isinstance(model, torch.nn.Module):
             model.to(device=self.device, dtype=self.dtype)

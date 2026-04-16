@@ -26,7 +26,7 @@ class TestWeightKeyMapping:
         assert "layers.0.self_attn.q_proj.weight" in sd
         assert "layers.0.self_attn.q_proj.bias" in sd
         assert "layers.0.self_attn.o_proj.weight" in sd
-        assert "layers.0.mlp.gate_proj.weight" in sd
+        assert "layers.0.mlp.gate_up_proj.weight" in sd
         assert "layers.1.input_layernorm.weight" in sd
 
         # Must NOT have lm_head (tied weights)
@@ -60,3 +60,19 @@ class TestHfKeyMapping:
         from somi_inference.models.qwen2_adapter import _map_hf_key
 
         assert _map_hf_key("model.layers.0.self_attn.rotary_emb.inv_freq") is None
+
+    def test_map_hf_gate_proj_shard_to_merged_key(self):
+        from somi_inference.models.qwen2_adapter import _map_hf_gate_up_proj_key
+
+        assert _map_hf_gate_up_proj_key("model.layers.0.mlp.gate_proj.weight") == (
+            "layers.0.mlp.gate_up_proj.weight",
+            0,
+        )
+
+    def test_map_hf_up_proj_shard_to_merged_key(self):
+        from somi_inference.models.qwen2_adapter import _map_hf_gate_up_proj_key
+
+        assert _map_hf_gate_up_proj_key("model.layers.0.mlp.up_proj.weight") == (
+            "layers.0.mlp.gate_up_proj.weight",
+            1,
+        )

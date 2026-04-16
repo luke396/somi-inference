@@ -12,8 +12,16 @@ from somi_inference.core.flash_attention_triton import (
     causal_attention_triton,
     triton_causal_attention_supported,
 )
+from somi_inference.core.mlp_triton import (
+    down_proj_triton,
+    gate_up_proj_triton,
+    get_packed_linear_weight,
+    should_auto_use_triton_linear,
+    triton_linear_supported,
+)
 
 PrefillAttentionBackend = Literal["auto", "torch_ref", "triton"]
+MLPBackend = Literal["auto", "torch_ref", "triton"]
 CAUSAL_ATTENTION_NDIM = 4
 
 
@@ -204,19 +212,58 @@ def causal_attention(
 
 
 class QwenMLP(nn.Module):
-    """SwiGLU-based MLP: gate + up projection, SiLU activation, down projection."""
+    """SwiGLU-based MLP with merged gate/up projection."""
 
-    def __init__(self, hidden_size: int, intermediate_size: int) -> None:
-        """Initialize projections for SwiGLU MLP."""
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        *,
+        backend: MLPBackend = "auto",
+    ) -> None:
+        """Initialize merged gate/up projection plus down projection."""
         super().__init__()
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.gate_up_proj = nn.Linear(hidden_size, 2 * intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.act = nn.SiLU()
+        self.backend = backend
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply SwiGLU: down(act(gate(x)) * up(x))."""
-        return self.down_proj(self.act(self.gate_proj(x)) * self.up_proj(x))
+        """Apply SwiGLU: down(silu(gate_up(x)[:I]) * gate_up(x)[I:])."""
+        gate, up = self._gate_up_proj(x).chunk(2, dim=-1)
+        return self._down_proj(self.act(gate) * up)
+
+    def _gate_up_proj(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the merged gate/up projection with backend dispatch."""
+        if self.backend == "torch_ref":
+            return self.gate_up_proj(x)
+        packed_weight = get_packed_linear_weight(self.gate_up_proj)
+        if self.backend == "triton":
+            if not triton_linear_supported(x, packed_weight):
+                msg = "Triton MLP backend is not available for these gate_up inputs"
+                raise RuntimeError(msg)
+            return gate_up_proj_triton(x, packed_weight)
+        if triton_linear_supported(
+            x, packed_weight
+        ) and should_auto_use_triton_linear(x):
+            return gate_up_proj_triton(x, packed_weight)
+        return self.gate_up_proj(x)
+
+    def _down_proj(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the down projection with backend dispatch."""
+        if self.backend == "torch_ref":
+            return self.down_proj(x)
+        packed_weight = get_packed_linear_weight(self.down_proj)
+        if self.backend == "triton":
+            if not triton_linear_supported(x, packed_weight):
+                msg = "Triton MLP backend is not available for these down_proj inputs"
+                raise RuntimeError(msg)
+            return down_proj_triton(x, packed_weight)
+        if triton_linear_supported(
+            x, packed_weight
+        ) and should_auto_use_triton_linear(x):
+            return down_proj_triton(x, packed_weight)
+        return self.down_proj(x)
 
 
 class QwenAttention(nn.Module):

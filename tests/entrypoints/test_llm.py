@@ -45,6 +45,7 @@ def patched_llm_dependencies(monkeypatch):
         def __init__(self):
             self.model = FakeTorchModule()
             self.prefill_attention_backend = "auto"
+            self.mlp_backend = "auto"
 
     adapter = FakeAdapter()
     config = {
@@ -230,6 +231,20 @@ def test_llm_initialization_forwards_prefill_attention_backend(
 
     adapter = patched_llm_dependencies["adapter"]
     assert adapter.prefill_attention_backend == "torch_ref"
+
+
+def test_llm_initialization_forwards_mlp_backend(
+    patched_llm_dependencies,
+):
+    """LLM should forward the requested MLP backend to adapters."""
+    LLM(
+        "Qwen/Qwen2.5-0.5B",
+        num_blocks=128,
+        mlp_backend="torch_ref",
+    )
+
+    adapter = patched_llm_dependencies["adapter"]
+    assert adapter.mlp_backend == "torch_ref"
 
 
 def test_llm_generate_builds_request_and_decodes_generated_tokens(

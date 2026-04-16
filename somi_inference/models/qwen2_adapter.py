@@ -11,7 +11,9 @@ from somi_inference.core.paged_attention import KVCacheManager, paged_attention_
 from somi_inference.models.qwen2 import (
     ForwardContext,
     ForwardMode,
+    MLPBackend,
     PrefillAttentionBackend,
+    QwenMLP,
     QwenModel,
     causal_attention,
 )
@@ -28,10 +30,26 @@ class QwenAdapter:
         model: QwenModel,
         *,
         prefill_attention_backend: PrefillAttentionBackend = "auto",
+        mlp_backend: MLPBackend = "auto",
     ) -> None:
         """Initialize adapter with a QwenModel instance."""
         self.model = model
         self.prefill_attention_backend = prefill_attention_backend
+        self._mlp_backend: MLPBackend = "auto"
+        self.mlp_backend = mlp_backend
+
+    @property
+    def mlp_backend(self) -> MLPBackend:
+        """Return the configured MLP backend for all decoder layers."""
+        return self._mlp_backend
+
+    @mlp_backend.setter
+    def mlp_backend(self, backend: MLPBackend) -> None:
+        """Set the MLP backend for every decoder-layer MLP in the model."""
+        for module in self.model.modules():
+            if isinstance(module, QwenMLP):
+                module.backend = backend
+        self._mlp_backend = backend
 
     def _lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project hidden states to vocab logits using tied embedding weights."""
@@ -43,7 +61,7 @@ class QwenAdapter:
         kv_manager: KVCacheManager,
         seq_id: int,
     ) -> torch.Tensor:
-        """Prefill a single sequence: write KV cache and return logits."""
+        """Prefill a single sequence: write KV cache and return last-token logits."""
 
         def _make_prefill_attn(seq_id: int, kv_manager: KVCacheManager) -> AttnFn:
             def attn_fn(
@@ -68,7 +86,7 @@ class QwenAdapter:
         )
         hidden_states = self.model(input_ids, ctx)
         kv_manager.advance_tokens(seq_id, seq_len)
-        return self._lm_head(hidden_states)
+        return self._lm_head(hidden_states[:, -1:, :])
 
     def decode(
         self,
@@ -125,6 +143,7 @@ def _map_hf_key(hf_key: str) -> str | None:
     - Strip 'model.' prefix
     - 'embed_tokens' -> 'token_embedding'
     - 'norm' -> 'final_layernorm'
+    - `mlp.gate_proj.weight` / `mlp.up_proj.weight` are merged separately
     - Skip 'lm_head.weight' (tied weights)
     - Skip 'rotary_emb.*' (computed buffers)
     """
@@ -148,6 +167,16 @@ def _map_hf_key(hf_key: str) -> str | None:
         return "final_layernorm.weight"
 
     return key
+
+
+def _map_hf_gate_up_proj_key(hf_key: str) -> tuple[str, int] | None:
+    """Map HF MLP gate/up shards onto the merged somi `gate_up_proj` weight."""
+    key = hf_key.removeprefix("model.")
+    if key.endswith(".mlp.gate_proj.weight"):
+        return key.replace(".mlp.gate_proj.weight", ".mlp.gate_up_proj.weight"), 0
+    if key.endswith(".mlp.up_proj.weight"):
+        return key.replace(".mlp.up_proj.weight", ".mlp.gate_up_proj.weight"), 1
+    return None
 
 
 def load_from_hf(model_name: str) -> QwenAdapter:
@@ -191,10 +220,22 @@ def load_from_hf(model_name: str) -> QwenAdapter:
 
     # Map and load weights
     somi_state_dict = {}
+    merged_gate_up_proj_shards: dict[str, dict[int, torch.Tensor]] = {}
     for hf_key, hf_tensor in hf_state_dict.items():
+        merged_gate_up_proj = _map_hf_gate_up_proj_key(hf_key)
+        if merged_gate_up_proj is not None:
+            somi_key, shard_idx = merged_gate_up_proj
+            shard_map = merged_gate_up_proj_shards.setdefault(somi_key, {})
+            shard_map[shard_idx] = hf_tensor
+            continue
         somi_key = _map_hf_key(hf_key)
         if somi_key is not None:
             somi_state_dict[somi_key] = hf_tensor
+    for somi_key, shard_map in merged_gate_up_proj_shards.items():
+        if set(shard_map) != {0, 1}:
+            msg = f"Missing gate/up shard for merged MLP weight: {somi_key}"
+            raise KeyError(msg)
+        somi_state_dict[somi_key] = torch.cat((shard_map[0], shard_map[1]), dim=0)
 
     # Load into somi model
     somi_model.load_state_dict(somi_state_dict, strict=True)

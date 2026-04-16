@@ -30,6 +30,7 @@ class PrefillBenchmarkAdapter(Protocol):
     """Benchmark adapter contract for selecting the prefill attention backend."""
 
     prefill_attention_backend: str
+    mlp_backend: str
 
     def prefill(
         self,
@@ -37,7 +38,7 @@ class PrefillBenchmarkAdapter(Protocol):
         kv_manager: KVCacheManager,
         seq_id: int,
     ) -> torch.Tensor:
-        """Run one prefill pass and return logits."""
+        """Run one prefill pass and return last-token logits."""
 
 
 def parse_args() -> argparse.Namespace:
@@ -98,6 +99,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--mlp-backend",
+        type=str,
+        default="auto",
+        choices=["auto", "torch_ref", "triton"],
+        help=(
+            "MLP projection backend. "
+            "'auto' prefers Triton on supported CUDA inputs."
+        ),
+    )
+    parser.add_argument(
         "--output-file",
         type=str,
         default=None,
@@ -128,6 +139,13 @@ def main() -> None:
         raise TypeError(message)
     benchmark_adapter = cast("PrefillBenchmarkAdapter", adapter)
     benchmark_adapter.prefill_attention_backend = args.attention_backend
+    if not hasattr(adapter, "mlp_backend"):
+        message = (
+            "Prefill benchmark requires an adapter with an "
+            "`mlp_backend` attribute."
+        )
+        raise TypeError(message)
+    benchmark_adapter.mlp_backend = args.mlp_backend
     environment = collect_environment_metadata(device)
 
     for prompt_len in args.prompt_lens:
@@ -164,7 +182,7 @@ def main() -> None:
             with torch.inference_mode():
                 logits = benchmark_adapter.prefill(prompt_ids, cache_manager, seq_id)
             cache_manager.free_sequence(seq_id)
-            return logits[:, -1, :]
+            return logits[:, 0, :]
 
         latencies = measure_runtime(
             run_once,
@@ -185,6 +203,7 @@ def main() -> None:
                 "device": str(device),
                 "dtype": str(dtype),
                 "attention_backend": args.attention_backend,
+                "mlp_backend": args.mlp_backend,
                 "warmup_iters": args.warmup_iters,
                 "measure_iters": args.measure_iters,
             },

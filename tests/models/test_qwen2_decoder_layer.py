@@ -52,8 +52,7 @@ class TestQwenDecoderLayer:
                 proj.weight.zero_()
                 proj.bias.zero_()
             layer.self_attn.o_proj.weight.zero_()
-            layer.mlp.gate_proj.weight.zero_()
-            layer.mlp.up_proj.weight.zero_()
+            layer.mlp.gate_up_proj.weight.zero_()
             layer.mlp.down_proj.weight.zero_()
 
         x = torch.randn(1, 5, 64)
@@ -80,7 +79,7 @@ class TestQwenDecoderLayer:
         out.sum().backward()
 
         assert layer.self_attn.q_proj.weight.grad is not None
-        assert layer.mlp.gate_proj.weight.grad is not None
+        assert layer.mlp.gate_up_proj.weight.grad is not None
         assert layer.input_layernorm.weight.grad is not None
         assert x.grad is not None
 
