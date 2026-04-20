@@ -64,7 +64,9 @@ uv run python -m benchmarks.bench_decode --model-name Qwen/Qwen2.5-0.5B --batch-
 uv run python -m benchmarks.bench_paged_attention --batch-sizes 1 4 --seq-lens 512 2048
 uv run python -m benchmarks.bench_paged_attention --backend torch_ref --batch-sizes 1 4 --seq-lens 128 512
 uv run python -m benchmarks.bench_paged_attention --backend triton --batch-sizes 1 4 --seq-lens 128 512
-uv run python -m benchmarks.bench_engine --model-name Qwen/Qwen2.5-0.5B --num-prompts 32 --prompt-len 128 --output-len 32
+uv run python -m benchmarks.bench_e2e --model-name Qwen/Qwen2.5-0.5B --device cuda --dtype float16 --attention-backend torch_ref --decode-attention-backend torch_ref --mlp-backend torch_ref --workload agent-session --preset mid
+uv run python -m benchmarks.bench_e2e --model-name Qwen/Qwen2.5-0.5B --device cuda --dtype float16 --attention-backend triton --decode-attention-backend triton --mlp-backend triton --workload chat-serving --preset long
+uv run python -m benchmarks.bench_engine --model-name Qwen/Qwen2.5-0.5B --workload agent-session --preset mid --arrival-pattern burst --max-concurrent 4
 scripts/run_cuda_benchmarks.sh             # lighter local preset
 MODE=server scripts/run_cuda_benchmarks.sh # fuller server preset
 ```

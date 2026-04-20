@@ -4,9 +4,12 @@ set -euo pipefail
 MODE="${MODE:-local}"
 MODEL_NAME="${MODEL_NAME:-Qwen/Qwen2.5-0.5B}"
 DEVICE="${DEVICE:-cuda}"
-DTYPE="${DTYPE:-auto}"
-PROMPT="${PROMPT:-人工智能的发展历程可以追溯到上世纪五十年代。}"
+DTYPE="${DTYPE:-float16}"
+BASE_PROMPT="${BASE_PROMPT:-人工智能的发展历程可以追溯到上世纪五十年代。}"
 RESULT_JSONL="${RESULT_JSONL:-benchmarks/results/$(date +%F)-${MODE}-cuda-benchmarks.jsonl}"
+E2E_ATTENTION_BACKEND="${E2E_ATTENTION_BACKEND:-torch_ref}"
+E2E_DECODE_ATTENTION_BACKEND="${E2E_DECODE_ATTENTION_BACKEND:-torch_ref}"
+E2E_MLP_BACKEND="${E2E_MLP_BACKEND:-torch_ref}"
 
 case "$MODE" in
 local)
@@ -17,12 +20,12 @@ local)
   PREFILL_PROMPT_LENS="${PREFILL_PROMPT_LENS:-32 128 512}"
   DECODE_BATCH_SIZES="${DECODE_BATCH_SIZES:-1 2}"
   DECODE_CONTEXT_LENS="${DECODE_CONTEXT_LENS:-128 512}"
-  MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32}"
   E2E_NUM_BLOCKS="${E2E_NUM_BLOCKS:-64}"
   E2E_MAX_CONCURRENT="${E2E_MAX_CONCURRENT:-4}"
-  ENGINE_NUM_PROMPTS="${ENGINE_NUM_PROMPTS:-16}"
-  ENGINE_PROMPT_LEN="${ENGINE_PROMPT_LEN:-128}"
-  ENGINE_OUTPUT_LEN="${ENGINE_OUTPUT_LEN:-16}"
+  E2E_AGENT_PRESET="${E2E_AGENT_PRESET:-mid}"
+  E2E_CHAT_PRESET="${E2E_CHAT_PRESET:-short}"
+  ENGINE_WORKLOAD="${ENGINE_WORKLOAD:-agent-session}"
+  ENGINE_PRESET="${ENGINE_PRESET:-$E2E_AGENT_PRESET}"
   ENGINE_MAX_CONCURRENT="${ENGINE_MAX_CONCURRENT:-4}"
   ENGINE_WARMUP_REQUESTS="${ENGINE_WARMUP_REQUESTS:-1}"
   ;;
@@ -34,12 +37,12 @@ server)
   PREFILL_PROMPT_LENS="${PREFILL_PROMPT_LENS:-32 128 512 2048}"
   DECODE_BATCH_SIZES="${DECODE_BATCH_SIZES:-1 2 4 8}"
   DECODE_CONTEXT_LENS="${DECODE_CONTEXT_LENS:-128 512 2048}"
-  MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
   E2E_NUM_BLOCKS="${E2E_NUM_BLOCKS:-256}"
   E2E_MAX_CONCURRENT="${E2E_MAX_CONCURRENT:-16}"
-  ENGINE_NUM_PROMPTS="${ENGINE_NUM_PROMPTS:-128}"
-  ENGINE_PROMPT_LEN="${ENGINE_PROMPT_LEN:-256}"
-  ENGINE_OUTPUT_LEN="${ENGINE_OUTPUT_LEN:-64}"
+  E2E_AGENT_PRESET="${E2E_AGENT_PRESET:-long}"
+  E2E_CHAT_PRESET="${E2E_CHAT_PRESET:-long}"
+  ENGINE_WORKLOAD="${ENGINE_WORKLOAD:-agent-session}"
+  ENGINE_PRESET="${ENGINE_PRESET:-$E2E_AGENT_PRESET}"
   ENGINE_MAX_CONCURRENT="${ENGINE_MAX_CONCURRENT:-16}"
   ENGINE_WARMUP_REQUESTS="${ENGINE_WARMUP_REQUESTS:-1}"
   ;;
@@ -99,19 +102,39 @@ run -m benchmarks.bench_e2e \
   --max-concurrent "$E2E_MAX_CONCURRENT" \
   --device "$DEVICE" \
   --dtype "$DTYPE" \
+  --attention-backend "$E2E_ATTENTION_BACKEND" \
+  --decode-attention-backend "$E2E_DECODE_ATTENTION_BACKEND" \
+  --mlp-backend "$E2E_MLP_BACKEND" \
   --warmup-iters "$WARMUP_ITERS" \
   --measure-iters "$MEASURE_ITERS" \
-  --prompt "$PROMPT" \
-  --max-new-tokens "$MAX_NEW_TOKENS" \
+  --workload agent-session \
+  --preset "$E2E_AGENT_PRESET" \
+  --base-prompt "$BASE_PROMPT" \
+  --output-file "$RESULT_JSONL"
+
+run -m benchmarks.bench_e2e \
+  --model-name "$MODEL_NAME" \
+  --num-blocks "$E2E_NUM_BLOCKS" \
+  --max-concurrent "$E2E_MAX_CONCURRENT" \
+  --device "$DEVICE" \
+  --dtype "$DTYPE" \
+  --attention-backend "$E2E_ATTENTION_BACKEND" \
+  --decode-attention-backend "$E2E_DECODE_ATTENTION_BACKEND" \
+  --mlp-backend "$E2E_MLP_BACKEND" \
+  --warmup-iters "$WARMUP_ITERS" \
+  --measure-iters "$MEASURE_ITERS" \
+  --workload chat-serving \
+  --preset "$E2E_CHAT_PRESET" \
+  --base-prompt "$BASE_PROMPT" \
   --output-file "$RESULT_JSONL"
 
 run -m benchmarks.bench_engine \
   --model-name "$MODEL_NAME" \
   --device "$DEVICE" \
   --dtype "$DTYPE" \
-  --num-prompts "$ENGINE_NUM_PROMPTS" \
-  --prompt-len "$ENGINE_PROMPT_LEN" \
-  --output-len "$ENGINE_OUTPUT_LEN" \
+  --workload "$ENGINE_WORKLOAD" \
+  --preset "$ENGINE_PRESET" \
+  --base-prompt "$BASE_PROMPT" \
   --max-concurrent "$ENGINE_MAX_CONCURRENT" \
   --warmup-requests "$ENGINE_WARMUP_REQUESTS" \
   --output-file "$RESULT_JSONL"
