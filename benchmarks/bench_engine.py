@@ -1,4 +1,4 @@
-"""Benchmark the continuous batching engine with synthetic arrivals."""
+"""Benchmark the continuous batching engine with workload arrivals."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import argparse
 import math
 import time
 from collections import deque
+from typing import cast, get_args
 
 import numpy as np
 import torch
@@ -22,6 +23,14 @@ from benchmarks.common import (
     resolve_dtype,
     seed_everything,
 )
+from benchmarks.workloads import (
+    DEFAULT_BASE_PROMPT_SEED,
+    BenchmarkTokenizer,
+    PresetName,
+    WorkloadName,
+    WorkloadTurnCase,
+    build_workload_turn_cases,
+)
 from somi_inference.core.continuous_batching import (
     ContinuousBatchingEngine,
     Scheduler,
@@ -30,9 +39,12 @@ from somi_inference.core.continuous_batching import (
 )
 from somi_inference.core.model_runner import ModelRunner
 from somi_inference.core.sampler import Sampler, SamplingParams
+from somi_inference.tokenizer import Tokenizer
+
+WorkloadRequestEntry = tuple[int, WorkloadTurnCase, Sequence]
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments."""
     parser = argparse.ArgumentParser(
         description="Benchmark the continuous batching engine throughput."
@@ -76,22 +88,24 @@ def parse_args() -> argparse.Namespace:
         help="Append benchmark results to a JSONL file.",
     )
     parser.add_argument(
-        "--num-prompts",
-        type=int,
-        default=128,
-        help="Number of requests in the benchmark workload.",
+        "--workload",
+        type=str,
+        required=True,
+        choices=get_args(WorkloadName),
+        help="Deterministic workload family to benchmark.",
     )
     parser.add_argument(
-        "--prompt-len",
-        type=int,
-        default=256,
-        help="Prompt length for each request.",
+        "--preset",
+        type=str,
+        default="mid",
+        choices=get_args(PresetName),
+        help="Preset size used by --workload.",
     )
     parser.add_argument(
-        "--output-len",
-        type=int,
-        default=64,
-        help="Target generated tokens per request.",
+        "--base-prompt",
+        type=str,
+        default=DEFAULT_BASE_PROMPT_SEED,
+        help="Seed text used to synthesize the base system prompt.",
     )
     parser.add_argument(
         "--arrival-pattern",
@@ -124,7 +138,7 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Warmup request count before the main run.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> None:
@@ -136,16 +150,39 @@ def main() -> None:
     adapter, config = load_benchmark_adapter(args.model_name, device, dtype)
     environment = collect_environment_metadata(device)
 
-    if args.prompt_len + args.output_len > config["max_position_embeddings"]:
+    tokenizer = Tokenizer(args.model_name)
+    workload_request_entries = build_workload_request_entries(
+        tokenizer=tokenizer,
+        workload=cast("WorkloadName", args.workload),
+        preset=cast("PresetName", args.preset),
+        base_prompt_seed=args.base_prompt,
+        arrival_pattern=args.arrival_pattern,
+        arrival_rate=args.arrival_rate,
+        seed=args.seed + 1,
+    )
+    max_sequence_tokens = max(
+        entry[1].actual_prompt_tokens + entry[1].requested_output_tokens
+        for entry in workload_request_entries
+    )
+    if max_sequence_tokens > config["max_position_embeddings"]:
         message = (
-            f"prompt_len + output_len exceeds max_position_embeddings: "
-            f"{args.prompt_len + args.output_len} > {config['max_position_embeddings']}"
+            f"workload sequence exceeds max_position_embeddings: "
+            f"{max_sequence_tokens} > {config['max_position_embeddings']}"
         )
         raise ValueError(message)
-
-    blocks_per_sequence = required_blocks(
-        args.prompt_len + args.output_len, args.block_size
+    requests = strip_request_metadata(workload_request_entries)
+    blocks_per_sequence = max(
+        required_blocks(
+            case.actual_prompt_tokens + case.requested_output_tokens,
+            args.block_size,
+        )
+        for _, case, _ in workload_request_entries
     )
+    warmup_requests = build_warmup_requests_from_entries(
+        workload_request_entries,
+        args.warmup_requests,
+    )
+
     num_blocks = args.num_blocks or (args.max_concurrent * blocks_per_sequence)
     kv_manager = create_kv_manager(
         config,
@@ -162,34 +199,13 @@ def main() -> None:
     )
     engine = ContinuousBatchingEngine(runner, scheduler, eos_token_id=-1)
 
-    warmup_requests = build_requests(
-        num_prompts=args.warmup_requests,
-        prompt_len=min(args.prompt_len, 32),
-        output_len=min(args.output_len, 8),
-        vocab_size=config["vocab_size"],
-        arrival_pattern="burst",
-        arrival_rate=1.0,
-        seed=args.seed,
-    )
     if warmup_requests:
         engine.run(deque(warmup_requests))
-
-    requests = deque(
-        build_requests(
-            num_prompts=args.num_prompts,
-            prompt_len=args.prompt_len,
-            output_len=args.output_len,
-            vocab_size=config["vocab_size"],
-            arrival_pattern=args.arrival_pattern,
-            arrival_rate=args.arrival_rate,
-            seed=args.seed + 1,
-        )
-    )
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     start = time.perf_counter()
-    finished = engine.run(requests)
+    finished = engine.run(deque(requests))
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     total_time = time.perf_counter() - start
@@ -207,19 +223,13 @@ def main() -> None:
     }
     payload = {
         "benchmark": "engine",
-        "config": {
-            "model_name": args.model_name,
-            "prompt_len": args.prompt_len,
-            "output_len": args.output_len,
-            "num_prompts": args.num_prompts,
-            "arrival_pattern": args.arrival_pattern,
-            "arrival_rate": args.arrival_rate,
-            "max_concurrent": args.max_concurrent,
-            "num_blocks": num_blocks,
-            "block_size": args.block_size,
-            "device": str(device),
-            "dtype": str(dtype),
-        },
+        "config": build_engine_config(
+            args=args,
+            device=device,
+            dtype=dtype,
+            num_blocks=num_blocks,
+            workload_request_entries=workload_request_entries,
+        ),
         "metrics": metrics,
         "environment": environment,
     }
@@ -230,46 +240,127 @@ def main() -> None:
     )
     append_jsonl(args.output_file, payload)
 
-
-def build_requests(
+def build_workload_request_entries(
     *,
-    num_prompts: int,
-    prompt_len: int,
-    output_len: int,
-    vocab_size: int,
+    tokenizer: BenchmarkTokenizer,
+    workload: WorkloadName,
+    preset: PresetName,
+    base_prompt_seed: str,
     arrival_pattern: str,
     arrival_rate: float,
     seed: int,
-) -> list[tuple[int, Sequence]]:
-    """Build a deterministic synthetic workload for the engine benchmark."""
-    if arrival_rate <= 0.0:
-        message = "arrival_rate must be > 0.0"
-        raise ValueError(message)
+) -> list[WorkloadRequestEntry]:
+    """Build arrival-tagged engine requests from deterministic workload cases."""
+    turn_cases = build_workload_turn_cases(
+        tokenizer=tokenizer,
+        workload=workload,
+        preset=preset,
+        base_prompt_seed=base_prompt_seed,
+    )
+    cases_by_session: dict[str, list[WorkloadTurnCase]] = {}
+    for case in turn_cases:
+        cases_by_session.setdefault(case.session_id, []).append(case)
 
     rng = np.random.default_rng(seed)
-    arrival_steps = make_arrival_steps(
-        num_prompts=num_prompts,
+    session_start_steps = make_arrival_steps(
+        num_prompts=len(cases_by_session),
         arrival_pattern=arrival_pattern,
         arrival_rate=arrival_rate,
         rng=rng,
     )
+
+    request_entries: list[WorkloadRequestEntry] = []
+    next_seq_id = 0
+    for (session_id, session_cases), start_step in zip(
+        cases_by_session.items(),
+        session_start_steps,
+        strict=True,
+    ):
+        del session_id
+        for case in sorted(session_cases, key=lambda item: item.turn_idx):
+            request_entries.append(
+                (
+                    start_step + case.turn_idx - 1,
+                    case,
+                    Sequence(
+                        seq_id=next_seq_id,
+                        status=SequenceStatus.WAITING,
+                        prompt_tokens=tokenizer.encode(case.prompt_text),
+                        output_tokens=[],
+                        max_new_tokens=case.requested_output_tokens,
+                        sampling_params=SamplingParams(temperature=0.0),
+                    ),
+                )
+            )
+            next_seq_id += 1
+
+    request_entries.sort(key=lambda item: (item[0], item[2].seq_id))
+    return request_entries
+
+
+def strip_request_metadata(
+    request_entries: list[WorkloadRequestEntry],
+) -> list[tuple[int, Sequence]]:
+    """Drop workload metadata and return engine-ready requests."""
+    return [(arrival_step, seq) for arrival_step, _, seq in request_entries]
+
+
+def build_warmup_requests_from_entries(
+    request_entries: list[WorkloadRequestEntry],
+    warmup_requests: int,
+) -> list[tuple[int, Sequence]]:
+    """Reuse the first workload requests as a cheap warmup input."""
     requests: list[tuple[int, Sequence]] = []
-    for seq_id, arrival_step in enumerate(arrival_steps):
-        prompt_tokens = rng.integers(0, vocab_size, size=prompt_len).tolist()
+    for seq_id, (_, _, seq) in enumerate(request_entries[:warmup_requests]):
         requests.append(
             (
-                arrival_step,
+                0,
                 Sequence(
                     seq_id=seq_id,
                     status=SequenceStatus.WAITING,
-                    prompt_tokens=prompt_tokens,
+                    prompt_tokens=list(seq.prompt_tokens),
                     output_tokens=[],
-                    max_new_tokens=output_len,
+                    max_new_tokens=min(seq.max_new_tokens, 8),
                     sampling_params=SamplingParams(temperature=0.0),
                 ),
             )
         )
     return requests
+
+
+def build_engine_config(
+    *,
+    args: argparse.Namespace,
+    device: torch.device,
+    dtype: torch.dtype,
+    num_blocks: int,
+    workload_request_entries: list[WorkloadRequestEntry],
+) -> dict[str, object]:
+    """Build the JSONL config payload for one engine benchmark run."""
+    prompt_tokens = [len(seq.prompt_tokens) for _, _, seq in workload_request_entries]
+    output_tokens = [seq.max_new_tokens for _, _, seq in workload_request_entries]
+    config: dict[str, object] = {
+        "model_name": args.model_name,
+        "mode": "workload_turn_trace",
+        "workload": args.workload,
+        "preset": args.preset,
+        "arrival_pattern": args.arrival_pattern,
+        "arrival_rate": args.arrival_rate,
+        "max_concurrent": args.max_concurrent,
+        "num_blocks": num_blocks,
+        "block_size": args.block_size,
+        "device": str(device),
+        "dtype": str(dtype),
+        "num_requests": len(workload_request_entries),
+        "num_sessions": len(
+            {case.session_id for _, case, _ in workload_request_entries}
+        ),
+        "min_prompt_tokens": min(prompt_tokens),
+        "max_prompt_tokens": max(prompt_tokens),
+        "min_output_tokens": min(output_tokens),
+        "max_output_tokens": max(output_tokens),
+    }
+    return config
 
 
 def make_arrival_steps(
@@ -280,6 +371,9 @@ def make_arrival_steps(
     rng: np.random.Generator,
 ) -> list[int]:
     """Generate integer arrival steps for the engine scheduler."""
+    if arrival_rate <= 0.0:
+        message = "arrival_rate must be > 0.0"
+        raise ValueError(message)
     if arrival_pattern == "burst":
         return [0] * num_prompts
     if arrival_pattern == "uniform":
