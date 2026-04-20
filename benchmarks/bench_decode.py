@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
 
@@ -25,6 +25,29 @@ from benchmarks.common import (
 if TYPE_CHECKING:
     from somi_inference.core.paged_attention import KVCacheManager
     from somi_inference.models.base import ModelAdapter
+
+
+class DecodeBenchmarkAdapter(Protocol):
+    """Benchmark adapter contract for selecting decode-stage backends."""
+
+    decode_attention_backend: str
+    mlp_backend: str
+
+    def prefill(
+        self,
+        input_ids: torch.Tensor,
+        kv_manager: KVCacheManager,
+        seq_id: int,
+    ) -> torch.Tensor:
+        """Prefill a single sequence."""
+
+    def decode(
+        self,
+        input_ids: torch.Tensor,
+        kv_manager: KVCacheManager,
+        seq_ids: list[int],
+    ) -> torch.Tensor:
+        """Decode one token for each active sequence."""
 
 
 class FixedContextDecodeBenchmark:
@@ -90,7 +113,7 @@ class FixedContextDecodeBenchmark:
             return self.adapter.decode(self.input_ids, self.kv_manager, self.seq_ids)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments."""
     parser = argparse.ArgumentParser(
         description="Benchmark fixed-context single-step decode latency."
@@ -140,6 +163,20 @@ def parse_args() -> argparse.Namespace:
         help="Number of timed iterations.",
     )
     parser.add_argument(
+        "--decode-attention-backend",
+        type=str,
+        default="torch_ref",
+        choices=["torch_ref", "triton"],
+        help="Decode paged-attention backend.",
+    )
+    parser.add_argument(
+        "--mlp-backend",
+        type=str,
+        default="torch_ref",
+        choices=["torch_ref", "triton"],
+        help="MLP projection backend used during decode.",
+    )
+    parser.add_argument(
         "--output-file",
         type=str,
         default=None,
@@ -159,7 +196,7 @@ def parse_args() -> argparse.Namespace:
         default=[128, 512, 2048],
         help="Fixed context lengths to benchmark.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> None:
@@ -169,6 +206,9 @@ def main() -> None:
     dtype = resolve_dtype(args.dtype, device)
     seed_everything(args.seed)
     adapter, config = load_benchmark_adapter(args.model_name, device, dtype)
+    benchmark_adapter = cast("DecodeBenchmarkAdapter", adapter)
+    benchmark_adapter.decode_attention_backend = args.decode_attention_backend
+    benchmark_adapter.mlp_backend = args.mlp_backend
     environment = collect_environment_metadata(device)
 
     for batch_size in args.batch_sizes:
@@ -215,6 +255,8 @@ def main() -> None:
                     "block_size": args.block_size,
                     "device": str(device),
                     "dtype": str(dtype),
+                    "decode_attention_backend": args.decode_attention_backend,
+                    "mlp_backend": args.mlp_backend,
                     "warmup_iters": args.warmup_iters,
                     "measure_iters": args.measure_iters,
                 },

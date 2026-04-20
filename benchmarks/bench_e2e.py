@@ -23,6 +23,7 @@ from benchmarks.workloads import (
     WorkloadName,
     WorkloadTurnCase,
     build_workload_turn_cases,
+    filter_turn_cases_by_output_tokens,
 )
 from somi_inference.entrypoints.llm import (
     DEFAULT_BLOCK_SIZE,
@@ -290,6 +291,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Append benchmark results to a JSONL file.",
     )
     parser.add_argument(
+        "--output-tokens",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Optional subset of requested output-token variants to benchmark.",
+    )
+    parser.add_argument(
         "--temperature",
         type=float,
         default=0.0,
@@ -344,6 +352,10 @@ def main() -> None:
         workload=cast("WorkloadName", args.workload),
         preset=cast("PresetName", args.preset),
         base_prompt_seed=args.base_prompt,
+    )
+    turn_cases = filter_turn_cases_by_output_tokens(
+        turn_cases,
+        None if args.output_tokens is None else tuple(args.output_tokens),
     )
     base_config = _base_benchmark_config(args=args, device=device, dtype=dtype)
 

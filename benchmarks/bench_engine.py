@@ -6,7 +6,7 @@ import argparse
 import math
 import time
 from collections import deque
-from typing import cast, get_args
+from typing import Protocol, cast, get_args
 
 import numpy as np
 import torch
@@ -30,6 +30,7 @@ from benchmarks.workloads import (
     WorkloadName,
     WorkloadTurnCase,
     build_workload_turn_cases,
+    filter_turn_cases_by_output_tokens,
 )
 from somi_inference.core.continuous_batching import (
     ContinuousBatchingEngine,
@@ -42,6 +43,14 @@ from somi_inference.core.sampler import Sampler, SamplingParams
 from somi_inference.tokenizer import Tokenizer
 
 WorkloadRequestEntry = tuple[int, WorkloadTurnCase, Sequence]
+
+
+class EngineBenchmarkAdapter(Protocol):
+    """Benchmark adapter contract for selecting engine-stage backends."""
+
+    prefill_attention_backend: str
+    decode_attention_backend: str
+    mlp_backend: str
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -80,6 +89,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=42,
         help="Random seed for synthetic workload generation.",
+    )
+    parser.add_argument(
+        "--attention-backend",
+        type=str,
+        default="torch_ref",
+        choices=["torch_ref", "triton"],
+        help="Prefill attention backend.",
+    )
+    parser.add_argument(
+        "--decode-attention-backend",
+        type=str,
+        default="torch_ref",
+        choices=["torch_ref", "triton"],
+        help="Decode paged-attention backend.",
+    )
+    parser.add_argument(
+        "--mlp-backend",
+        type=str,
+        default="torch_ref",
+        choices=["torch_ref", "triton"],
+        help="MLP projection backend.",
     )
     parser.add_argument(
         "--output-file",
@@ -138,6 +168,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=1,
         help="Warmup request count before the main run.",
     )
+    parser.add_argument(
+        "--output-tokens",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Optional subset of requested output-token variants to benchmark.",
+    )
     return parser.parse_args(argv)
 
 
@@ -148,6 +185,10 @@ def main() -> None:
     dtype = resolve_dtype(args.dtype, device)
     seed_everything(args.seed)
     adapter, config = load_benchmark_adapter(args.model_name, device, dtype)
+    benchmark_adapter = cast("EngineBenchmarkAdapter", adapter)
+    benchmark_adapter.prefill_attention_backend = args.attention_backend
+    benchmark_adapter.decode_attention_backend = args.decode_attention_backend
+    benchmark_adapter.mlp_backend = args.mlp_backend
     environment = collect_environment_metadata(device)
 
     tokenizer = Tokenizer(args.model_name)
@@ -159,6 +200,7 @@ def main() -> None:
         arrival_pattern=args.arrival_pattern,
         arrival_rate=args.arrival_rate,
         seed=args.seed + 1,
+        output_tokens=None if args.output_tokens is None else tuple(args.output_tokens),
     )
     max_sequence_tokens = max(
         entry[1].actual_prompt_tokens + entry[1].requested_output_tokens
@@ -249,6 +291,7 @@ def build_workload_request_entries(
     arrival_pattern: str,
     arrival_rate: float,
     seed: int,
+    output_tokens: tuple[int, ...] | None = None,
 ) -> list[WorkloadRequestEntry]:
     """Build arrival-tagged engine requests from deterministic workload cases."""
     turn_cases = build_workload_turn_cases(
@@ -257,6 +300,7 @@ def build_workload_request_entries(
         preset=preset,
         base_prompt_seed=base_prompt_seed,
     )
+    turn_cases = filter_turn_cases_by_output_tokens(turn_cases, output_tokens)
     cases_by_session: dict[str, list[WorkloadTurnCase]] = {}
     for case in turn_cases:
         cases_by_session.setdefault(case.session_id, []).append(case)
@@ -351,6 +395,9 @@ def build_engine_config(
         "block_size": args.block_size,
         "device": str(device),
         "dtype": str(dtype),
+        "attention_backend": args.attention_backend,
+        "decode_attention_backend": args.decode_attention_backend,
+        "mlp_backend": args.mlp_backend,
         "num_requests": len(workload_request_entries),
         "num_sessions": len(
             {case.session_id for _, case, _ in workload_request_entries}

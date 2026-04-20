@@ -53,3 +53,6 @@ docs/plans/
 
 # Local benchmark outputs
 benchmarks/results/
+
+# Local resume artifacts
+.local/

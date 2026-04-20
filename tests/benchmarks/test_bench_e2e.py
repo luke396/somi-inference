@@ -112,6 +112,32 @@ def test_parse_args_accepts_explicit_execution_config() -> None:
     assert args.mlp_backend == "triton"
 
 
+def test_parse_args_accepts_output_token_filter() -> None:
+    """bench_e2e should accept filtering output-token variants."""
+    args = bench_e2e.parse_args(
+        [
+            "--model-name",
+            "Qwen/Qwen2.5-0.5B",
+            "--device",
+            "cuda",
+            "--dtype",
+            "float16",
+            "--attention-backend",
+            "torch_ref",
+            "--decode-attention-backend",
+            "torch_ref",
+            "--mlp-backend",
+            "torch_ref",
+            "--workload",
+            "agent-session",
+            "--output-tokens",
+            "1",
+        ]
+    )
+
+    assert args.output_tokens == [1]
+
+
 def test_parse_args_rejects_auto_values() -> None:
     """bench_e2e should no longer accept fuzzy auto choices."""
     with pytest.raises(SystemExit):

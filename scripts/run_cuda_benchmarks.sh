@@ -4,12 +4,10 @@ set -euo pipefail
 MODE="${MODE:-local}"
 MODEL_NAME="${MODEL_NAME:-Qwen/Qwen2.5-0.5B}"
 DEVICE="${DEVICE:-cuda}"
-DTYPE="${DTYPE:-float16}"
+DTYPE="float16"
 BASE_PROMPT="${BASE_PROMPT:-人工智能的发展历程可以追溯到上世纪五十年代。}"
-RESULT_JSONL="${RESULT_JSONL:-benchmarks/results/$(date +%F)-${MODE}-cuda-benchmarks.jsonl}"
-E2E_ATTENTION_BACKEND="${E2E_ATTENTION_BACKEND:-torch_ref}"
-E2E_DECODE_ATTENTION_BACKEND="${E2E_DECODE_ATTENTION_BACKEND:-torch_ref}"
-E2E_MLP_BACKEND="${E2E_MLP_BACKEND:-torch_ref}"
+RESULT_JSONL="${RESULT_JSONL:-benchmarks/results/$(date +%F)-${MODE}-cuda-backend-compare.jsonl}"
+COMPARISON_BACKENDS=(torch_ref triton)
 
 case "$MODE" in
 local)
@@ -66,77 +64,91 @@ run() {
 }
 
 printf 'running CUDA benchmarks in %s mode\n' "$MODE"
+printf 'dtype -> %s\n' "$DTYPE"
+printf 'backend compare -> %s\n' "${COMPARISON_BACKENDS[*]}"
 printf 'results -> %s\n' "$RESULT_JSONL"
 
-run -m benchmarks.bench_paged_attention \
-  --device "$DEVICE" \
-  --dtype "$DTYPE" \
-  --warmup-iters "$WARMUP_ITERS" \
-  --measure-iters "$MEASURE_ITERS" \
-  --batch-sizes "${paged_attention_batch_sizes[@]}" \
-  --seq-lens "${paged_attention_seq_lens[@]}" \
-  --output-file "$RESULT_JSONL"
+for backend in "${COMPARISON_BACKENDS[@]}"; do
+  printf '\n=== backend: %s ===\n' "$backend"
 
-run -m benchmarks.bench_prefill \
-  --model-name "$MODEL_NAME" \
-  --device "$DEVICE" \
-  --dtype "$DTYPE" \
-  --warmup-iters "$WARMUP_ITERS" \
-  --measure-iters "$MEASURE_ITERS" \
-  --prompt-lens "${prefill_prompt_lens[@]}" \
-  --output-file "$RESULT_JSONL"
+  run -m benchmarks.bench_paged_attention \
+    --device "$DEVICE" \
+    --dtype "$DTYPE" \
+    --backend "$backend" \
+    --warmup-iters "$WARMUP_ITERS" \
+    --measure-iters "$MEASURE_ITERS" \
+    --batch-sizes "${paged_attention_batch_sizes[@]}" \
+    --seq-lens "${paged_attention_seq_lens[@]}" \
+    --output-file "$RESULT_JSONL"
 
-run -m benchmarks.bench_decode \
-  --model-name "$MODEL_NAME" \
-  --device "$DEVICE" \
-  --dtype "$DTYPE" \
-  --warmup-iters "$WARMUP_ITERS" \
-  --measure-iters "$MEASURE_ITERS" \
-  --batch-sizes "${decode_batch_sizes[@]}" \
-  --context-lens "${decode_context_lens[@]}" \
-  --output-file "$RESULT_JSONL"
+  run -m benchmarks.bench_prefill \
+    --model-name "$MODEL_NAME" \
+    --device "$DEVICE" \
+    --dtype "$DTYPE" \
+    --attention-backend "$backend" \
+    --mlp-backend "$backend" \
+    --warmup-iters "$WARMUP_ITERS" \
+    --measure-iters "$MEASURE_ITERS" \
+    --prompt-lens "${prefill_prompt_lens[@]}" \
+    --output-file "$RESULT_JSONL"
 
-run -m benchmarks.bench_e2e \
-  --model-name "$MODEL_NAME" \
-  --num-blocks "$E2E_NUM_BLOCKS" \
-  --max-concurrent "$E2E_MAX_CONCURRENT" \
-  --device "$DEVICE" \
-  --dtype "$DTYPE" \
-  --attention-backend "$E2E_ATTENTION_BACKEND" \
-  --decode-attention-backend "$E2E_DECODE_ATTENTION_BACKEND" \
-  --mlp-backend "$E2E_MLP_BACKEND" \
-  --warmup-iters "$WARMUP_ITERS" \
-  --measure-iters "$MEASURE_ITERS" \
-  --workload agent-session \
-  --preset "$E2E_AGENT_PRESET" \
-  --base-prompt "$BASE_PROMPT" \
-  --output-file "$RESULT_JSONL"
+  run -m benchmarks.bench_decode \
+    --model-name "$MODEL_NAME" \
+    --device "$DEVICE" \
+    --dtype "$DTYPE" \
+    --decode-attention-backend "$backend" \
+    --mlp-backend "$backend" \
+    --warmup-iters "$WARMUP_ITERS" \
+    --measure-iters "$MEASURE_ITERS" \
+    --batch-sizes "${decode_batch_sizes[@]}" \
+    --context-lens "${decode_context_lens[@]}" \
+    --output-file "$RESULT_JSONL"
 
-run -m benchmarks.bench_e2e \
-  --model-name "$MODEL_NAME" \
-  --num-blocks "$E2E_NUM_BLOCKS" \
-  --max-concurrent "$E2E_MAX_CONCURRENT" \
-  --device "$DEVICE" \
-  --dtype "$DTYPE" \
-  --attention-backend "$E2E_ATTENTION_BACKEND" \
-  --decode-attention-backend "$E2E_DECODE_ATTENTION_BACKEND" \
-  --mlp-backend "$E2E_MLP_BACKEND" \
-  --warmup-iters "$WARMUP_ITERS" \
-  --measure-iters "$MEASURE_ITERS" \
-  --workload chat-serving \
-  --preset "$E2E_CHAT_PRESET" \
-  --base-prompt "$BASE_PROMPT" \
-  --output-file "$RESULT_JSONL"
+  run -m benchmarks.bench_e2e \
+    --model-name "$MODEL_NAME" \
+    --num-blocks "$E2E_NUM_BLOCKS" \
+    --max-concurrent "$E2E_MAX_CONCURRENT" \
+    --device "$DEVICE" \
+    --dtype "$DTYPE" \
+    --attention-backend "$backend" \
+    --decode-attention-backend "$backend" \
+    --mlp-backend "$backend" \
+    --warmup-iters "$WARMUP_ITERS" \
+    --measure-iters "$MEASURE_ITERS" \
+    --workload agent-session \
+    --preset "$E2E_AGENT_PRESET" \
+    --base-prompt "$BASE_PROMPT" \
+    --output-file "$RESULT_JSONL"
 
-run -m benchmarks.bench_engine \
-  --model-name "$MODEL_NAME" \
-  --device "$DEVICE" \
-  --dtype "$DTYPE" \
-  --workload "$ENGINE_WORKLOAD" \
-  --preset "$ENGINE_PRESET" \
-  --base-prompt "$BASE_PROMPT" \
-  --max-concurrent "$ENGINE_MAX_CONCURRENT" \
-  --warmup-requests "$ENGINE_WARMUP_REQUESTS" \
-  --output-file "$RESULT_JSONL"
+  run -m benchmarks.bench_e2e \
+    --model-name "$MODEL_NAME" \
+    --num-blocks "$E2E_NUM_BLOCKS" \
+    --max-concurrent "$E2E_MAX_CONCURRENT" \
+    --device "$DEVICE" \
+    --dtype "$DTYPE" \
+    --attention-backend "$backend" \
+    --decode-attention-backend "$backend" \
+    --mlp-backend "$backend" \
+    --warmup-iters "$WARMUP_ITERS" \
+    --measure-iters "$MEASURE_ITERS" \
+    --workload chat-serving \
+    --preset "$E2E_CHAT_PRESET" \
+    --base-prompt "$BASE_PROMPT" \
+    --output-file "$RESULT_JSONL"
+
+  run -m benchmarks.bench_engine \
+    --model-name "$MODEL_NAME" \
+    --device "$DEVICE" \
+    --dtype "$DTYPE" \
+    --attention-backend "$backend" \
+    --decode-attention-backend "$backend" \
+    --mlp-backend "$backend" \
+    --workload "$ENGINE_WORKLOAD" \
+    --preset "$ENGINE_PRESET" \
+    --base-prompt "$BASE_PROMPT" \
+    --max-concurrent "$ENGINE_MAX_CONCURRENT" \
+    --warmup-requests "$ENGINE_WARMUP_REQUESTS" \
+    --output-file "$RESULT_JSONL"
+done
 
 printf 'saved results to %s\n' "$RESULT_JSONL"

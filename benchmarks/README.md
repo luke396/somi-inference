@@ -92,7 +92,18 @@ Run the convenience script with local or server presets:
 ```bash
 scripts/run_cuda_benchmarks.sh
 MODE=server scripts/run_cuda_benchmarks.sh
+scripts/run_resume_benchmarks.sh
 ```
+
+The convenience script fixes `dtype=float16` and runs a backend comparison sweep
+for both `torch_ref` and `triton`, appending both variants to the same JSONL so
+the results can be compared directly.
+
+`scripts/run_resume_benchmarks.sh` is the focused evaluation path used by the
+top-level `README.md`: it runs a small, resume-friendly comparison matrix,
+writes raw JSONL under `.local/resume/`, refreshes the committed charts in
+`docs/images/benchmarks/`, and updates the generated evaluation block in
+`README.md`.
 
 ## Notes
 
@@ -102,6 +113,7 @@ MODE=server scripts/run_cuda_benchmarks.sh
 - `bench_e2e.py` is workload-only now: it benchmarks deterministic multi-turn `agent-session` and `chat-serving` presets through the public `LLM.generate()` path.
 - `bench_e2e.py` requires explicit `--device`, `--dtype`, `--attention-backend`, `--decode-attention-backend`, and `--mlp-backend`; `cuda` is the device, while `torch_ref` / `triton` are kernel backend choices.
 - `bench_e2e.py` appends one JSONL row per turn with `mode`, `scenario`, `session_id`, `turn_idx`, `requested_prompt_tokens`, `actual_prompt_tokens`, and `requested_output_tokens`.
+- `bench_e2e.py` and `bench_engine.py` accept `--output-tokens` so targeted traces such as one-token TTFT comparisons can reuse the same workload definitions without editing code.
 - `agent-session` runs `1` and `32` token decode variants, while `chat-serving` runs `64`, `128`, and `256` token decode variants.
 - `--base-prompt` controls the seed text used to synthesize the base system prompt for both workload families.
 - `bench_engine.py` now supports the same `--workload` / `--preset` families as `bench_e2e.py`; it tokenizes those prompts before timing, then benchmarks only the in-process scheduler / engine path.
@@ -110,3 +122,4 @@ MODE=server scripts/run_cuda_benchmarks.sh
 - JSONL payloads now include an `environment` object with `git_sha`, `git_dirty`, Python / PyTorch versions, and the resolved device name.
 - `bench_engine.py` benchmarks the current in-process scheduler / engine path, not an HTTP serving stack; it preserves the same prompt growth and output-length semantics as `bench_e2e.py`, but tokenizes prompts before timing so scheduler / engine measurements stay isolated.
 - `scripts/run_cuda_benchmarks.sh` defaults to a lighter `MODE=local` preset for small GPUs and uses `MODE=server` for the fuller sweep.
+- `scripts/run_cuda_benchmarks.sh` now runs the same sweep twice—once with `torch_ref` and once with `triton`—while keeping `dtype=float16` fixed for apples-to-apples comparisons.

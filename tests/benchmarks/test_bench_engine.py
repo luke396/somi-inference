@@ -71,6 +71,23 @@ def test_build_workload_request_entries_uses_case_output_lengths() -> None:
     assert {seq.max_new_tokens for _, _, seq in entries} == {64, 128, 256}
 
 
+def test_build_workload_request_entries_filters_requested_output_lengths() -> None:
+    """Filtering output lengths should keep only matching workload requests."""
+    entries = bench_engine.build_workload_request_entries(
+        tokenizer=FakeTokenizer(),
+        workload="agent-session",
+        preset="mid",
+        base_prompt_seed="seed",
+        arrival_pattern="burst",
+        arrival_rate=1.0,
+        seed=42,
+        output_tokens=(1,),
+    )
+
+    assert len(entries) == 6
+    assert {seq.max_new_tokens for _, _, seq in entries} == {1}
+
+
 def test_parse_args_accepts_workload_mode() -> None:
     """bench_engine should accept workload and preset options."""
     args = bench_engine.parse_args(
@@ -81,11 +98,23 @@ def test_parse_args_accepts_workload_mode() -> None:
             "chat-serving",
             "--preset",
             "long",
+            "--attention-backend",
+            "triton",
+            "--decode-attention-backend",
+            "triton",
+            "--mlp-backend",
+            "triton",
+            "--output-tokens",
+            "1",
         ]
     )
 
     assert args.workload == "chat-serving"
     assert args.preset == "long"
+    assert args.attention_backend == "triton"
+    assert args.decode_attention_backend == "triton"
+    assert args.mlp_backend == "triton"
+    assert args.output_tokens == [1]
 
 
 def test_parse_args_requires_workload_mode() -> None:

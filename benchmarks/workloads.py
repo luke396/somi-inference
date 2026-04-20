@@ -279,3 +279,26 @@ def build_workload_turn_cases(
             requested_history_tokens = requested_prompt_tokens + output_tokens
 
     return cases
+
+
+def filter_turn_cases_by_output_tokens(
+    turn_cases: list[WorkloadTurnCase],
+    output_tokens: tuple[int, ...] | None,
+) -> list[WorkloadTurnCase]:
+    """Filter workload cases by requested output tokens when requested."""
+    if output_tokens is None:
+        return turn_cases
+
+    allowed_output_tokens = set(output_tokens)
+    filtered_cases = [
+        case
+        for case in turn_cases
+        if case.requested_output_tokens in allowed_output_tokens
+    ]
+    if not filtered_cases:
+        message = (
+            "No workload cases matched --output-tokens="
+            f"{sorted(allowed_output_tokens)}."
+        )
+        raise ValueError(message)
+    return filtered_cases
