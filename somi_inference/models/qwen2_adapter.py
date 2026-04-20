@@ -7,7 +7,11 @@ from collections.abc import Callable
 import torch
 import torch.nn.functional as F  # noqa: N812
 
-from somi_inference.core.paged_attention import KVCacheManager, paged_attention_decode
+from somi_inference.core.paged_attention import (
+    KVCacheManager,
+    PagedAttentionBackend,
+    paged_attention_decode,
+)
 from somi_inference.models.qwen2 import (
     ForwardContext,
     ForwardMode,
@@ -29,13 +33,15 @@ class QwenAdapter:
         self,
         model: QwenModel,
         *,
-        prefill_attention_backend: PrefillAttentionBackend = "auto",
-        mlp_backend: MLPBackend = "auto",
+        prefill_attention_backend: PrefillAttentionBackend = "torch_ref",
+        decode_attention_backend: PagedAttentionBackend = "torch_ref",
+        mlp_backend: MLPBackend = "torch_ref",
     ) -> None:
         """Initialize adapter with a QwenModel instance."""
         self.model = model
         self.prefill_attention_backend = prefill_attention_backend
-        self._mlp_backend: MLPBackend = "auto"
+        self.decode_attention_backend = decode_attention_backend
+        self._mlp_backend: MLPBackend = "torch_ref"
         self.mlp_backend = mlp_backend
 
     @property
@@ -113,7 +119,11 @@ class QwenAdapter:
                 cache = kv_manager.kv_caches[layer_idx]
                 q_decode = q.squeeze(2)  # (batch_size, num_heads, head_dim)
                 attn_output = paged_attention_decode(
-                    q_decode, cache.kv_cache, block_tables, seq_lens
+                    q_decode,
+                    cache.kv_cache,
+                    block_tables,
+                    seq_lens,
+                    backend=self.decode_attention_backend,
                 )  # (batch_size, num_heads, head_dim)
                 return attn_output.unsqueeze(2)  # (batch_size, num_heads, 1, head_dim)
 

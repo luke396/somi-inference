@@ -1,21 +1,28 @@
-"""Benchmark single-request end-to-end generation via LLM.generate()."""
+"""Benchmark deterministic workload turns via LLM.generate()."""
 
 from __future__ import annotations
 
 import argparse
 import time
-from typing import Literal, cast
+from typing import TYPE_CHECKING, cast, get_args
+
+import torch
 
 from benchmarks.common import (
     append_jsonl,
     collect_environment_metadata,
     measure_runtime,
     print_result,
-    resolve_device,
-    resolve_dtype,
     seed_everything,
     summarize_latencies,
     synchronize,
+)
+from benchmarks.workloads import (
+    DEFAULT_BASE_PROMPT_SEED,
+    PresetName,
+    WorkloadName,
+    WorkloadTurnCase,
+    build_workload_turn_cases,
 )
 from somi_inference.entrypoints.llm import (
     DEFAULT_BLOCK_SIZE,
@@ -23,42 +30,152 @@ from somi_inference.entrypoints.llm import (
     LLM,
 )
 
-MLPBackend = Literal["auto", "torch_ref", "triton"]
+if TYPE_CHECKING:
+    from typing import Any
+
+    from somi_inference.core.paged_attention import PagedAttentionBackend
+    from somi_inference.entrypoints.llm import MLPBackend, PrefillAttentionBackend
+
+DTYPE_BY_NAME = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+EXPLICIT_BACKEND_CHOICES = ("torch_ref", "triton")
 
 
-def _make_target_prompt(llm: LLM, base_prompt: str, target_tokens: int) -> str:
-    """Build a prompt string whose encoded length closely tracks `target_tokens`."""
-    if target_tokens <= 0:
-        message = "--prompt-lens values must be positive."
-        raise ValueError(message)
-    base_token_ids = llm.tokenizer.encode(base_prompt)
-    if not base_token_ids:
-        message = "Prompt text produced zero tokens; provide a non-empty prompt."
-        raise ValueError(message)
-    target_decode_len = target_tokens
-    best_prompt = base_prompt
-    best_distance = float("inf")
+def _measure_prompt_generation(
+    *,
+    llm: LLM,
+    prompt_text: str,
+    prompt_token_count: int,
+    max_new_tokens: int,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> dict[str, float]:
+    """Measure TTFT and full-generation latency for one prompt."""
 
-    for _ in range(8):
-        repeats = (target_decode_len + len(base_token_ids) - 1) // len(base_token_ids)
-        repeated_ids = (base_token_ids * repeats)[:target_decode_len]
-        prompt_text = llm.tokenizer.decode(repeated_ids)
-        actual_tokens = len(llm.tokenizer.encode(prompt_text))
-        distance = abs(actual_tokens - target_tokens)
-        if distance < best_distance:
-            best_prompt = prompt_text
-            best_distance = distance
-        if actual_tokens == target_tokens:
-            return prompt_text
-        target_decode_len = max(target_decode_len + (target_tokens - actual_tokens), 1)
+    def generate_once(token_limit: int, prompt: str = prompt_text) -> str:
+        return llm.generate(
+            prompt,
+            max_new_tokens=token_limit,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            repetition_penalty=args.repetition_penalty,
+        )
 
-    return best_prompt
+    ttft_latencies = measure_runtime(
+        lambda: generate_once(1),
+        warmup_iters=args.warmup_iters,
+        measure_iters=args.measure_iters,
+        device=device,
+    )
+
+    for _ in range(args.warmup_iters):
+        synchronize(device)
+        generate_once(max_new_tokens)
+        synchronize(device)
+
+    generation_latencies: list[float] = []
+    output_token_counts: list[int] = []
+    for _ in range(args.measure_iters):
+        synchronize(device)
+        start = time.perf_counter()
+        output_text = generate_once(max_new_tokens)
+        synchronize(device)
+        generation_latencies.append(time.perf_counter() - start)
+        output_token_counts.append(len(llm.tokenizer.encode(output_text)))
+
+    metrics = summarize_latencies(generation_latencies)
+    metrics.update(
+        {
+            f"ttft_{key}": value
+            for key, value in summarize_latencies(ttft_latencies).items()
+        }
+    )
+    total_time = sum(generation_latencies)
+    total_input_tokens = prompt_token_count * args.measure_iters
+    total_output_tokens = sum(output_token_counts)
+    metrics["mean_output_tokens"] = total_output_tokens / args.measure_iters
+    metrics["input_tokens_per_s"] = total_input_tokens / total_time
+    metrics["output_tokens_per_s"] = total_output_tokens / total_time
+    metrics["total_tokens_per_s"] = (
+        total_input_tokens + total_output_tokens
+    ) / total_time
+    return metrics
 
 
-def parse_args() -> argparse.Namespace:
+def _base_benchmark_config(
+    *,
+    args: argparse.Namespace,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict[str, str | int]:
+    """Return the config fields shared by every E2E benchmark case."""
+    return {
+        "model_name": args.model_name,
+        "num_blocks": args.num_blocks,
+        "block_size": args.block_size,
+        "max_concurrent": args.max_concurrent,
+        "temperature": args.temperature,
+        "top_k": args.top_k,
+        "top_p": args.top_p,
+        "repetition_penalty": args.repetition_penalty,
+        "device": str(device),
+        "dtype": str(dtype),
+        "attention_backend": args.attention_backend,
+        "decode_attention_backend": args.decode_attention_backend,
+        "mlp_backend": args.mlp_backend,
+        "warmup_iters": args.warmup_iters,
+        "measure_iters": args.measure_iters,
+    }
+
+
+def _build_benchmark_payload(
+    *,
+    case: WorkloadTurnCase,
+    metrics: dict[str, float],
+    base_config: dict[str, str | int],
+    environment: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the JSONL payload for one workload turn."""
+    config = dict(base_config)
+    config.update(
+        {
+            "mode": "workload_turn",
+            "workload": case.workload,
+            "preset": case.preset,
+            "scenario": case.scenario,
+            "session_id": case.session_id,
+            "turn_idx": case.turn_idx,
+            "num_turns": case.num_turns,
+            "base_prompt_tokens": case.base_prompt_tokens,
+            "user_tokens": case.user_tokens,
+            "tool_tokens": case.tool_tokens,
+            "prompt_chars": len(case.prompt_text),
+            "requested_prompt_tokens": case.requested_prompt_tokens,
+            "actual_prompt_tokens": case.actual_prompt_tokens,
+            "prompt_tokens": case.actual_prompt_tokens,
+            "requested_output_tokens": case.requested_output_tokens,
+            "max_new_tokens": case.requested_output_tokens,
+        }
+    )
+    return {
+        "benchmark": "e2e",
+        "config": config,
+        "metrics": metrics,
+        "environment": environment,
+    }
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments."""
     parser = argparse.ArgumentParser(
-        description="Benchmark single-request end-to-end generation latency."
+        description=(
+            "Benchmark deterministic multi-turn chat or agent workloads via "
+            "LLM.generate()."
+        )
     )
     parser.add_argument(
         "--model-name",
@@ -87,36 +204,66 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--device",
         type=str,
-        default="auto",
-        choices=["auto", "cpu", "cuda"],
-        help="Execution device. 'auto' prefers CUDA when available.",
+        required=True,
+        choices=["cpu", "cuda"],
+        help="Execution device.",
     )
     parser.add_argument(
         "--dtype",
         type=str,
-        default="auto",
-        choices=["auto", "float32", "float16", "bfloat16"],
-        help="Model / cache dtype. 'auto' picks a device-appropriate default.",
+        required=True,
+        choices=tuple(DTYPE_BY_NAME),
+        help="Model and KV-cache dtype.",
     )
     parser.add_argument(
         "--attention-backend",
         type=str,
-        default="auto",
-        choices=["auto", "torch_ref", "triton"],
+        required=True,
+        choices=EXPLICIT_BACKEND_CHOICES,
         help=(
             "Prefill attention backend. "
-            "'auto' prefers Triton on supported CUDA inputs."
+            "`cuda` is selected by --device, not here."
+        ),
+    )
+    parser.add_argument(
+        "--decode-attention-backend",
+        type=str,
+        required=True,
+        choices=EXPLICIT_BACKEND_CHOICES,
+        help=(
+            "Decode paged-attention backend. "
+            "`cuda` is selected by --device, not here."
         ),
     )
     parser.add_argument(
         "--mlp-backend",
         type=str,
-        default="auto",
-        choices=["auto", "torch_ref", "triton"],
+        required=True,
+        choices=EXPLICIT_BACKEND_CHOICES,
         help=(
             "MLP projection backend. "
-            "'auto' prefers Triton on supported CUDA inputs."
+            "`cuda` is selected by --device, not here."
         ),
+    )
+    parser.add_argument(
+        "--workload",
+        type=str,
+        required=True,
+        choices=get_args(WorkloadName),
+        help="Deterministic workload family to benchmark.",
+    )
+    parser.add_argument(
+        "--preset",
+        type=str,
+        default="mid",
+        choices=get_args(PresetName),
+        help="Preset size used by --workload.",
+    )
+    parser.add_argument(
+        "--base-prompt",
+        type=str,
+        default=DEFAULT_BASE_PROMPT_SEED,
+        help="Seed text used to synthesize the base system prompt.",
     )
     parser.add_argument(
         "--seed",
@@ -143,29 +290,6 @@ def parse_args() -> argparse.Namespace:
         help="Append benchmark results to a JSONL file.",
     )
     parser.add_argument(
-        "--prompt",
-        type=str,
-        default="Explain how paged attention works in one paragraph.",
-        help="Single prompt to benchmark.",
-    )
-    parser.add_argument(
-        "--prompt-lens",
-        type=int,
-        nargs="+",
-        default=None,
-        help=(
-            "Optional target prompt token lengths. "
-            "When set, bench_e2e runs once per length using "
-            "a decoded repeated-token prompt."
-        ),
-    )
-    parser.add_argument(
-        "--max-new-tokens",
-        type=int,
-        default=32,
-        help="Maximum number of generated tokens per iteration.",
-    )
-    parser.add_argument(
         "--temperature",
         type=float,
         default=0.0,
@@ -189,14 +313,14 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Repetition penalty applied by the sampler.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> None:
     """Run the end-to-end benchmark."""
     args = parse_args()
-    device = resolve_device(args.device)
-    dtype = resolve_dtype(args.dtype, device)
+    device = torch.device(args.device)
+    dtype = DTYPE_BY_NAME[args.dtype]
     seed_everything(args.seed)
     environment = collect_environment_metadata(device)
 
@@ -207,103 +331,39 @@ def main() -> None:
         max_concurrent=args.max_concurrent,
         device=device,
         dtype=dtype,
-        prefill_attention_backend=args.attention_backend,
+        prefill_attention_backend=cast(
+            "PrefillAttentionBackend", args.attention_backend
+        ),
+        decode_attention_backend=cast(
+            "PagedAttentionBackend", args.decode_attention_backend
+        ),
         mlp_backend=cast("MLPBackend", args.mlp_backend),
     )
-    prompt_texts = (
-        [
-            _make_target_prompt(llm, args.prompt, prompt_len)
-            for prompt_len in args.prompt_lens
-        ]
-        if args.prompt_lens is not None
-        else [args.prompt]
+    turn_cases = build_workload_turn_cases(
+        tokenizer=llm.tokenizer,
+        workload=cast("WorkloadName", args.workload),
+        preset=cast("PresetName", args.preset),
+        base_prompt_seed=args.base_prompt,
     )
+    base_config = _base_benchmark_config(args=args, device=device, dtype=dtype)
 
-    requested_prompt_tokens = args.prompt_lens or [None] * len(prompt_texts)
-
-    for prompt_text, requested_prompt_len in zip(
-        prompt_texts,
-        requested_prompt_tokens,
-        strict=True,
-    ):
-        prompt_token_count = len(llm.tokenizer.encode(prompt_text))
-
-        def generate_once(max_new_tokens: int, prompt: str = prompt_text) -> str:
-            return llm.generate(
-                prompt,
-                max_new_tokens=max_new_tokens,
-                temperature=args.temperature,
-                top_k=args.top_k,
-                top_p=args.top_p,
-                repetition_penalty=args.repetition_penalty,
-            )
-
-        ttft_latencies = measure_runtime(
-            lambda: generate_once(1),
-            warmup_iters=args.warmup_iters,
-            measure_iters=args.measure_iters,
+    for case in turn_cases:
+        metrics = _measure_prompt_generation(
+            llm=llm,
+            prompt_text=case.prompt_text,
+            prompt_token_count=case.actual_prompt_tokens,
+            max_new_tokens=case.requested_output_tokens,
+            args=args,
             device=device,
         )
-
-        for _ in range(args.warmup_iters):
-            synchronize(device)
-            generate_once(args.max_new_tokens)
-            synchronize(device)
-
-        generation_latencies: list[float] = []
-        output_token_counts: list[int] = []
-        for _ in range(args.measure_iters):
-            synchronize(device)
-            start = time.perf_counter()
-            output_text = generate_once(args.max_new_tokens)
-            synchronize(device)
-            generation_latencies.append(time.perf_counter() - start)
-            output_token_counts.append(len(llm.tokenizer.encode(output_text)))
-
-        metrics = summarize_latencies(generation_latencies)
-        metrics.update(
-            {
-                f"ttft_{key}": value
-                for key, value in summarize_latencies(ttft_latencies).items()
-            }
+        payload = _build_benchmark_payload(
+            case=case,
+            metrics=metrics,
+            base_config=base_config,
+            environment=environment,
         )
-        total_time = sum(generation_latencies)
-        total_input_tokens = prompt_token_count * args.measure_iters
-        total_output_tokens = sum(output_token_counts)
-        metrics["mean_output_tokens"] = total_output_tokens / args.measure_iters
-        metrics["input_tokens_per_s"] = total_input_tokens / total_time
-        metrics["output_tokens_per_s"] = total_output_tokens / total_time
-        metrics["total_tokens_per_s"] = (
-            total_input_tokens + total_output_tokens
-        ) / total_time
-
-        payload = {
-            "benchmark": "e2e",
-            "config": {
-                "model_name": args.model_name,
-                "num_blocks": args.num_blocks,
-                "block_size": args.block_size,
-                "max_concurrent": args.max_concurrent,
-                "prompt_chars": len(prompt_text),
-                "requested_prompt_tokens": requested_prompt_len,
-                "prompt_tokens": prompt_token_count,
-                "max_new_tokens": args.max_new_tokens,
-                "temperature": args.temperature,
-                "top_k": args.top_k,
-                "top_p": args.top_p,
-                "repetition_penalty": args.repetition_penalty,
-                "device": str(device),
-                "dtype": str(dtype),
-                "attention_backend": args.attention_backend,
-                "mlp_backend": args.mlp_backend,
-                "warmup_iters": args.warmup_iters,
-                "measure_iters": args.measure_iters,
-            },
-            "metrics": metrics,
-            "environment": environment,
-        }
         print_result(
-            title=" E2E Benchmark ",
+            title=" E2E Workload Turn ",
             config=payload["config"],
             metrics=payload["metrics"],
         )

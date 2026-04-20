@@ -22,7 +22,6 @@ else:
     tl = cast("Any", _tl)
 
 SUPPORTED_TRITON_DTYPES = {torch.float16}
-MIN_AUTO_TOKENS = 16
 MIN_LINEAR_NDIM = 2
 
 if TRITON_AVAILABLE:
@@ -159,12 +158,6 @@ def triton_linear_supported(x: torch.Tensor, packed_weight: torch.Tensor) -> boo
         and x_2d.is_contiguous()
         and packed_weight.is_contiguous()
     )
-
-
-def should_auto_use_triton_linear(x: torch.Tensor) -> bool:
-    """Heuristic for whether the Triton linear path is worth trying."""
-    return x.shape[-2] >= MIN_AUTO_TOKENS
-
 
 def _matmul_triton(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Run row-major `a @ b` with a Triton matmul kernel."""

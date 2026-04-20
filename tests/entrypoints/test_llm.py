@@ -1,5 +1,7 @@
 """Tests for the high-level LLM API."""
 
+from typing import Any, cast
+
 import pytest
 import torch
 
@@ -10,7 +12,7 @@ from somi_inference.entrypoints.llm import LLM
 @pytest.fixture
 def patched_llm_dependencies(monkeypatch):
     """Patch all LLM collaborators with lightweight test doubles."""
-    registry = {
+    registry: dict[str, Any] = {
         "run_calls": [],
         "outputs_by_seq_id": {
             0: [101, 102],
@@ -44,8 +46,9 @@ def patched_llm_dependencies(monkeypatch):
 
         def __init__(self):
             self.model = FakeTorchModule()
-            self.prefill_attention_backend = "auto"
-            self.mlp_backend = "auto"
+            self.prefill_attention_backend = "torch_ref"
+            self.decode_attention_backend = "torch_ref"
+            self.mlp_backend = "torch_ref"
 
     adapter = FakeAdapter()
     config = {
@@ -247,6 +250,20 @@ def test_llm_initialization_forwards_mlp_backend(
     assert adapter.mlp_backend == "torch_ref"
 
 
+def test_llm_initialization_forwards_decode_attention_backend(
+    patched_llm_dependencies,
+):
+    """LLM should forward the requested decode attention backend to adapters."""
+    LLM(
+        "Qwen/Qwen2.5-0.5B",
+        num_blocks=128,
+        decode_attention_backend="torch_ref",
+    )
+
+    adapter = patched_llm_dependencies["adapter"]
+    assert adapter.decode_attention_backend == "torch_ref"
+
+
 def test_llm_generate_builds_request_and_decodes_generated_tokens(
     patched_llm_dependencies,
 ):
@@ -367,8 +384,9 @@ def test_llm_generate_reuses_real_engine_without_finished_leak(monkeypatch):
 
     assert output_0 == "decoded:100"
     assert output_1 == "decoded:101"
-    assert llm.kv_manager.registered_seq_ids == [0, 1]
-    assert llm.kv_manager.freed_seq_ids == [0, 1]
+    kv_manager = cast("FakeKVCacheManager", llm.kv_manager)
+    assert kv_manager.registered_seq_ids == [0, 1]
+    assert kv_manager.freed_seq_ids == [0, 1]
 
 
 def test_llm_generate_stream_not_implemented(patched_llm_dependencies):

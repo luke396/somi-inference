@@ -105,8 +105,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backend",
         type=str,
-        default="auto",
-        choices=["auto", "torch_ref", "triton"],
+        default="torch_ref",
+        choices=["torch_ref", "triton"],
         help="Attention backend to benchmark.",
     )
     return parser.parse_args()

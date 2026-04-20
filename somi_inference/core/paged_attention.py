@@ -12,7 +12,7 @@ from somi_inference.core.paged_attention_triton import (
     triton_paged_attention_supported,
 )
 
-PagedAttentionBackend = Literal["auto", "torch_ref", "triton"]
+PagedAttentionBackend = Literal["torch_ref", "triton"]
 KV_CACHE_NUM_PLANES = 2
 BLOCK_TABLE_NDIM = 2
 KV_CACHE_NDIM = 5
@@ -419,28 +419,18 @@ def paged_attention_decode(
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     *,
-    backend: PagedAttentionBackend = "auto",
+    backend: PagedAttentionBackend = "torch_ref",
 ) -> torch.Tensor:
-    """Compute decode attention over paged KV cache.
-
-    ``backend="auto"`` prefers Triton on supported CUDA inputs and otherwise
-    falls back to the PyTorch reference path.
-    """
+    """Compute decode attention over paged KV cache."""
     # Validate once at the public entry point; the backend helpers assume the
     # basic shape/device contract already holds.
     _validate_paged_attention_inputs(q, kv_cache, block_tables, seq_lens)
-    if backend not in {"auto", "torch_ref", "triton"}:
+    if backend not in {"torch_ref", "triton"}:
         msg = f"Unsupported paged attention backend: {backend}"
         raise ValueError(msg)
     if backend == "torch_ref":
         return paged_attention_decode_torch_ref(q, kv_cache, block_tables, seq_lens)
-    if backend == "triton":
-        if not triton_paged_attention_supported(q, kv_cache, block_tables, seq_lens):
-            msg = "Triton paged attention backend is not available for these inputs"
-            raise RuntimeError(msg)
-        return paged_attention_decode_triton(q, kv_cache, block_tables, seq_lens)
-    # `auto` keeps CPU and unsupported CUDA shapes on the simple reference path,
-    # but lets the real decode hot path transparently use the Triton backend.
-    if triton_paged_attention_supported(q, kv_cache, block_tables, seq_lens):
-        return paged_attention_decode_triton(q, kv_cache, block_tables, seq_lens)
-    return paged_attention_decode_torch_ref(q, kv_cache, block_tables, seq_lens)
+    if not triton_paged_attention_supported(q, kv_cache, block_tables, seq_lens):
+        msg = "Triton paged attention backend is not available for these inputs"
+        raise RuntimeError(msg)
+    return paged_attention_decode_triton(q, kv_cache, block_tables, seq_lens)

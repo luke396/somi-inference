@@ -240,15 +240,15 @@ class TestCausalAttention:
         assert out.dtype == dtype
         assert torch.isfinite(out.float()).all()
 
-    def test_auto_backend_matches_torch_ref_on_cpu(self):
-        """CPU auto-dispatch should fall back to the reference implementation."""
+    def test_default_backend_matches_torch_ref_on_cpu(self):
+        """The default backend should match the explicit reference path on CPU."""
         torch.manual_seed(42)
         q = torch.randn(2, 4, 7, 16)
         k = torch.randn(2, 2, 7, 16)
         v = torch.randn(2, 2, 7, 16)
 
         expected = causal_attention_torch_ref(q, k, v)
-        actual = causal_attention(q, k, v, backend="auto")
+        actual = causal_attention(q, k, v)
 
         torch.testing.assert_close(actual, expected)
 

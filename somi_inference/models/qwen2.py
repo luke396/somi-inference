@@ -16,12 +16,11 @@ from somi_inference.core.mlp_triton import (
     down_proj_triton,
     gate_up_proj_triton,
     get_packed_linear_weight,
-    should_auto_use_triton_linear,
     triton_linear_supported,
 )
 
-PrefillAttentionBackend = Literal["auto", "torch_ref", "triton"]
-MLPBackend = Literal["auto", "torch_ref", "triton"]
+PrefillAttentionBackend = Literal["torch_ref", "triton"]
+MLPBackend = Literal["torch_ref", "triton"]
 CAUSAL_ATTENTION_NDIM = 4
 
 
@@ -192,23 +191,19 @@ def causal_attention(
     k: torch.Tensor,  # (batch_size, num_kv_heads, seq_len, head_dim)
     v: torch.Tensor,  # (batch_size, num_kv_heads, seq_len, head_dim)
     *,
-    backend: PrefillAttentionBackend = "auto",
+    backend: PrefillAttentionBackend = "torch_ref",
 ) -> torch.Tensor:
-    """Compute prefill causal attention with automatic backend dispatch."""
+    """Compute prefill causal attention with an explicit backend."""
     _validate_causal_attention_inputs(q, k, v)
-    if backend not in {"auto", "torch_ref", "triton"}:
+    if backend not in {"torch_ref", "triton"}:
         msg = f"Unsupported causal attention backend: {backend}"
         raise ValueError(msg)
     if backend == "torch_ref":
         return causal_attention_torch_ref(q, k, v)
-    if backend == "triton":
-        if not triton_causal_attention_supported(q, k, v):
-            msg = "Triton causal attention backend is not available for these inputs"
-            raise RuntimeError(msg)
-        return causal_attention_triton(q, k, v)
-    if triton_causal_attention_supported(q, k, v):
-        return causal_attention_triton(q, k, v)
-    return causal_attention_torch_ref(q, k, v)
+    if not triton_causal_attention_supported(q, k, v):
+        msg = "Triton causal attention backend is not available for these inputs"
+        raise RuntimeError(msg)
+    return causal_attention_triton(q, k, v)
 
 
 class QwenMLP(nn.Module):
@@ -219,7 +214,7 @@ class QwenMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         *,
-        backend: MLPBackend = "auto",
+        backend: MLPBackend = "torch_ref",
     ) -> None:
         """Initialize merged gate/up projection plus down projection."""
         super().__init__()
@@ -238,32 +233,20 @@ class QwenMLP(nn.Module):
         if self.backend == "torch_ref":
             return self.gate_up_proj(x)
         packed_weight = get_packed_linear_weight(self.gate_up_proj)
-        if self.backend == "triton":
-            if not triton_linear_supported(x, packed_weight):
-                msg = "Triton MLP backend is not available for these gate_up inputs"
-                raise RuntimeError(msg)
-            return gate_up_proj_triton(x, packed_weight)
-        if triton_linear_supported(
-            x, packed_weight
-        ) and should_auto_use_triton_linear(x):
-            return gate_up_proj_triton(x, packed_weight)
-        return self.gate_up_proj(x)
+        if not triton_linear_supported(x, packed_weight):
+            msg = "Triton MLP backend is not available for these gate_up inputs"
+            raise RuntimeError(msg)
+        return gate_up_proj_triton(x, packed_weight)
 
     def _down_proj(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the down projection with backend dispatch."""
         if self.backend == "torch_ref":
             return self.down_proj(x)
         packed_weight = get_packed_linear_weight(self.down_proj)
-        if self.backend == "triton":
-            if not triton_linear_supported(x, packed_weight):
-                msg = "Triton MLP backend is not available for these down_proj inputs"
-                raise RuntimeError(msg)
-            return down_proj_triton(x, packed_weight)
-        if triton_linear_supported(
-            x, packed_weight
-        ) and should_auto_use_triton_linear(x):
-            return down_proj_triton(x, packed_weight)
-        return self.down_proj(x)
+        if not triton_linear_supported(x, packed_weight):
+            msg = "Triton MLP backend is not available for these down_proj inputs"
+            raise RuntimeError(msg)
+        return down_proj_triton(x, packed_weight)
 
 
 class QwenAttention(nn.Module):

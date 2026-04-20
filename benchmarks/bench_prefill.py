@@ -91,22 +91,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--attention-backend",
         type=str,
-        default="auto",
-        choices=["auto", "torch_ref", "triton"],
-        help=(
-            "Prefill attention backend. "
-            "'auto' prefers Triton on supported CUDA inputs."
-        ),
+        default="torch_ref",
+        choices=["torch_ref", "triton"],
+        help="Prefill attention backend.",
     )
     parser.add_argument(
         "--mlp-backend",
         type=str,
-        default="auto",
-        choices=["auto", "torch_ref", "triton"],
-        help=(
-            "MLP projection backend. "
-            "'auto' prefers Triton on supported CUDA inputs."
-        ),
+        default="torch_ref",
+        choices=["torch_ref", "triton"],
+        help="MLP projection backend.",
     )
     parser.add_argument(
         "--output-file",
@@ -131,20 +125,8 @@ def main() -> None:
     dtype = resolve_dtype(args.dtype, device)
     seed_everything(args.seed)
     adapter, config = load_benchmark_adapter(args.model_name, device, dtype)
-    if not hasattr(adapter, "prefill_attention_backend"):
-        message = (
-            "Prefill benchmark requires an adapter with a "
-            "`prefill_attention_backend` attribute."
-        )
-        raise TypeError(message)
     benchmark_adapter = cast("PrefillBenchmarkAdapter", adapter)
     benchmark_adapter.prefill_attention_backend = args.attention_backend
-    if not hasattr(adapter, "mlp_backend"):
-        message = (
-            "Prefill benchmark requires an adapter with an "
-            "`mlp_backend` attribute."
-        )
-        raise TypeError(message)
     benchmark_adapter.mlp_backend = args.mlp_backend
     environment = collect_environment_metadata(device)
 

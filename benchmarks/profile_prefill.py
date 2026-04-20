@@ -24,7 +24,6 @@ from benchmarks.common import (
     synchronize,
 )
 from somi_inference.core.paged_attention import KVCacheManager
-from somi_inference.models import qwen2 as qwen2_module
 from somi_inference.models.qwen2 import (
     ForwardContext,
     PrefillAttentionBackend,
@@ -74,8 +73,7 @@ class StageTiming:
 class ProfileResult:
     """Profile summary for one backend on one prompt."""
 
-    requested_backend: PrefillAttentionBackend
-    resolved_attention_backend: str
+    attention_backend: PrefillAttentionBackend
     prompt_len: int
     measurement_name: str
     total_time_ms: float
@@ -112,7 +110,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         nargs="+",
         default=["torch_ref", "triton"],
-        choices=["auto", "torch_ref", "triton"],
+        choices=["torch_ref", "triton"],
         help="Prefill attention backends to profile, run serially in order.",
     )
     parser.add_argument(
@@ -180,21 +178,6 @@ def _build_input_ids(
         raise ValueError(message)
     input_ids = torch.tensor([token_ids], device=device, dtype=torch.long)
     return input_ids, "text"
-
-
-def _resolve_attention_backend(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    backend: PrefillAttentionBackend,
-) -> str:
-    if backend == "auto":
-        return (
-            "triton"
-            if qwen2_module.triton_causal_attention_supported(q, k, v)
-            else "torch_ref"
-        )
-    return backend
 
 
 def _measurement_name(device: torch.device) -> str:
@@ -277,10 +260,9 @@ def _install_stage_hooks(*, split_mlp: bool = False) -> Iterator[None]:
         k: torch.Tensor,
         v: torch.Tensor,
         *,
-        backend: PrefillAttentionBackend = "auto",
+        backend: PrefillAttentionBackend = "torch_ref",
     ) -> torch.Tensor:
-        resolved_backend = _resolve_attention_backend(q, k, v, backend)
-        with record_function(f"{STAGE_PREFIX}causal_attention[{resolved_backend}]"):
+        with record_function(f"{STAGE_PREFIX}causal_attention[{backend}]"):
             return original_causal_attention(q, k, v, backend=backend)
 
     with ExitStack() as stack:
@@ -320,7 +302,7 @@ def _run_prefill_once(
 def _summarize_profile(
     profiler: torch.profiler.profile,
     *,
-    requested_backend: PrefillAttentionBackend,
+    attention_backend: PrefillAttentionBackend,
     prompt_len: int,
     device: torch.device,
     stage_labels: tuple[str, ...],
@@ -336,12 +318,12 @@ def _summarize_profile(
     )
     if attention_labels:
         attention_label = attention_labels[0]
-        resolved_backend = attention_label.removeprefix(
+        attention_backend_label = attention_label.removeprefix(
             f"{STAGE_PREFIX}causal_attention["
         ).removesuffix("]")
     else:
         attention_label = None
-        resolved_backend = "unknown"
+        attention_backend_label = attention_backend
 
     stage_timings: list[StageTiming] = []
     tracked_time_ms = 0.0
@@ -368,7 +350,7 @@ def _summarize_profile(
         stage_timings.insert(
             1,
             StageTiming(
-                label=f"causal_attention[{resolved_backend}]",
+                label=f"causal_attention[{attention_backend_label}]",
                 time_ms=attention_time_ms,
                 share_pct=share_pct,
             ),
@@ -385,8 +367,7 @@ def _summarize_profile(
     )
 
     return ProfileResult(
-        requested_backend=requested_backend,
-        resolved_attention_backend=resolved_backend,
+        attention_backend=attention_backend,
         prompt_len=prompt_len,
         measurement_name=_measurement_name(device),
         total_time_ms=total_time_ms,
@@ -440,7 +421,7 @@ def _profile_backend(
 
     return _summarize_profile(
         profiler,
-        requested_backend=backend,
+        attention_backend=backend,
         prompt_len=input_ids.size(1),
         device=device,
         stage_labels=stage_labels,
@@ -466,10 +447,7 @@ def _print_header(
 
 
 def _print_result(result: ProfileResult) -> None:
-    print(
-        f"\n--- backend={result.requested_backend}"
-        f" (resolved_attention={result.resolved_attention_backend}) ---"
-    )
+    print(f"\n--- backend={result.attention_backend} ---")
     print(f"total_{result.measurement_name}_ms={result.total_time_ms:.3f}")
     for stage in result.stage_timings:
         print(
@@ -487,9 +465,7 @@ def main() -> None:
     seed_everything(args.seed)
 
     adapter, config = load_benchmark_adapter(args.model_name, device, dtype)
-    if not isinstance(adapter, QwenAdapter):
-        message = "Prefill profiler currently expects a QwenAdapter."
-        raise TypeError(message)
+    adapter = cast("QwenAdapter", adapter)
 
     input_ids, prompt_source = _build_input_ids(
         args,

@@ -32,9 +32,6 @@ def resolve_device(device_name: str) -> torch.device:
     """Resolve a user-provided device string."""
     if device_name == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device_name == "cuda" and not torch.cuda.is_available():
-        message = "CUDA requested but torch.cuda.is_available() is False."
-        raise ValueError(message)
     return torch.device(device_name)
 
 
@@ -52,11 +49,7 @@ def resolve_dtype(dtype_name: str, device: torch.device) -> torch.dtype:
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
     }
-    dtype = dtype_map[dtype_name]
-    if device.type == "cpu" and dtype == torch.float16:
-        message = "float16 CPU benchmark is not supported; use float32 or bfloat16."
-        raise ValueError(message)
-    return dtype
+    return dtype_map[dtype_name]
 
 
 def seed_everything(seed: int) -> None:
