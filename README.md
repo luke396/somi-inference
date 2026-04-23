@@ -17,7 +17,7 @@ A learning-oriented project that implements core LLM inference components from s
 
 - [x] **Phase 1**: PyTorch baseline — paged attention, Qwen2.5 model, e2e greedy decode
 - [x] **Phase 2**: End-to-end inference pipeline — ModelRunner, Tokenizer, text-in/text-out API
-- [ ] **Phase 3**: Triton/CUDA optimization — flash attention, fused kernels, quantization
+- [ ] **Phase 3**: Triton/CUDA optimization — core decode/prefill/MLP Triton paths landed, benchmarked, and currently paused before serving work
 - [ ] **Phase 4**: Serving — HTTP API, concurrent requests, streaming
 
 ## Installation
