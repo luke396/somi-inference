@@ -18,7 +18,7 @@ from benchmarks.common import (
     seed_everything,
     summarize_latencies,
 )
-from somi_inference.core.paged_attention import paged_attention_decode
+from somi_inference.core.paged_attention import pack_kv_cache, paged_attention_decode
 
 
 def parse_args() -> argparse.Namespace:
@@ -102,6 +102,13 @@ def parse_args() -> argparse.Namespace:
         default=32,
         help="Per-head hidden dimension.",
     )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="torch_ref",
+        choices=["torch_ref", "triton"],
+        help="Attention backend to benchmark.",
+    )
     return parser.parse_args()
 
 
@@ -133,6 +140,7 @@ def main() -> None:
                 dtype=dtype,
             )
             value_cache = torch.randn_like(key_cache)
+            kv_cache = pack_kv_cache(key_cache, value_cache)
             block_tables = torch.arange(
                 num_blocks, device=device, dtype=torch.long
             ).reshape(batch_size, max_blocks_per_seq)
@@ -142,17 +150,16 @@ def main() -> None:
 
             def run_once(
                 q_tensor: torch.Tensor = q,
-                key_cache_tensor: torch.Tensor = key_cache,
-                value_cache_tensor: torch.Tensor = value_cache,
+                kv_cache_tensor: torch.Tensor = kv_cache,
                 block_tables_tensor: torch.Tensor = block_tables,
                 seq_lens_tensor: torch.Tensor = seq_lens,
             ) -> torch.Tensor:
                 return paged_attention_decode(
                     q_tensor,
-                    key_cache_tensor,
-                    value_cache_tensor,
+                    kv_cache_tensor,
                     block_tables_tensor,
                     seq_lens_tensor,
+                    backend=args.backend,
                 )
 
             latencies = measure_runtime(
@@ -176,6 +183,7 @@ def main() -> None:
                     "num_q_heads": args.num_q_heads,
                     "num_kv_heads": args.num_kv_heads,
                     "head_dim": args.head_dim,
+                    "backend": args.backend,
                     "device": str(device),
                     "dtype": str(dtype),
                     "warmup_iters": args.warmup_iters,

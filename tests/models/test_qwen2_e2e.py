@@ -1,5 +1,7 @@
 """End-to-end test: somi greedy decode matches HF model.generate()."""
 
+from typing import cast
+
 import pytest
 import torch
 
@@ -10,13 +12,20 @@ MODEL_NAME = "Qwen/Qwen2.5-0.5B"
 class TestQwen2E2E:
     def test_greedy_decode_matches_hf(self):
         """Somi adapter greedy decode output matches HF generate() exactly."""
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import (
+            AutoModelForCausalLM,
+            AutoTokenizer,
+            PreTrainedTokenizerBase,
+        )
 
         from somi_inference.core.paged_attention import KVCacheManager
         from somi_inference.models.qwen2_adapter import load_from_hf
 
         # Load HF model
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        tokenizer = cast(
+            PreTrainedTokenizerBase,
+            AutoTokenizer.from_pretrained(MODEL_NAME),
+        )
         hf_model = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME, dtype=torch.float32,
         )
@@ -57,7 +66,7 @@ class TestQwen2E2E:
         with torch.inference_mode():
             # Prefill
             logits = adapter.prefill(input_ids, kv_manager, seq_id=0)
-            next_token = logits[:, -1, :].argmax(dim=-1).item()
+            next_token = logits[:, 0, :].argmax(dim=-1).item()
             somi_tokens.append(next_token)
 
             # Decode

@@ -28,7 +28,7 @@ class ModelAdapter(Protocol):
             seq_id: Sequence ID for this request
 
         Returns:
-            logits: Output logits, shape (batch_size, seq_len, vocab_size)
+            logits: Output logits, shape (batch_size, 1, vocab_size)
 
         """
         ...

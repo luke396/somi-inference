@@ -3,9 +3,25 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
+from typing import Literal
 
 import torch
 from torch import nn
+
+from somi_inference.core.flash_attention_triton import (
+    causal_attention_triton,
+    triton_causal_attention_supported,
+)
+from somi_inference.core.mlp_triton import (
+    down_proj_triton,
+    gate_up_proj_triton,
+    get_packed_linear_weight,
+    triton_linear_supported,
+)
+
+PrefillAttentionBackend = Literal["torch_ref", "triton"]
+MLPBackend = Literal["torch_ref", "triton"]
+CAUSAL_ATTENTION_NDIM = 4
 
 
 class ForwardMode(Enum):
@@ -97,7 +113,49 @@ def apply_rotary_pos_emb(
     return q_embed, k_embed
 
 
-def causal_attention(
+def _num_queries_per_kv(num_q_heads: int, num_kv_heads: int) -> int:
+    if num_q_heads % num_kv_heads != 0:
+        msg = (
+            f"num_q_heads ({num_q_heads}) must be "
+            f"divisible by num_kv_heads ({num_kv_heads})"
+        )
+        raise ValueError(msg)
+    return num_q_heads // num_kv_heads
+
+
+def _validate_causal_attention_inputs(
+    q: torch.Tensor,  # (batch_size, num_q_heads, seq_len, head_dim)
+    k: torch.Tensor,  # (batch_size, num_kv_heads, seq_len, head_dim)
+    v: torch.Tensor,  # (batch_size, num_kv_heads, seq_len, head_dim)
+) -> None:
+    if q.dim() != CAUSAL_ATTENTION_NDIM:
+        msg = "q must have shape (batch_size, num_q_heads, seq_len, head_dim)"
+        raise ValueError(msg)
+    if k.dim() != CAUSAL_ATTENTION_NDIM:
+        msg = "k must have shape (batch_size, num_kv_heads, seq_len, head_dim)"
+        raise ValueError(msg)
+    if v.dim() != CAUSAL_ATTENTION_NDIM:
+        msg = "v must have shape (batch_size, num_kv_heads, seq_len, head_dim)"
+        raise ValueError(msg)
+    if q.shape[0] != k.shape[0] or q.shape[0] != v.shape[0]:
+        msg = "q, k, and v must agree on batch_size"
+        raise ValueError(msg)
+    if q.shape[2] != k.shape[2] or q.shape[2] != v.shape[2]:
+        msg = "q, k, and v must agree on seq_len"
+        raise ValueError(msg)
+    if q.shape[3] != k.shape[3] or q.shape[3] != v.shape[3]:
+        msg = "q, k, and v must agree on head_dim"
+        raise ValueError(msg)
+    if k.shape[1] != v.shape[1]:
+        msg = "k and v must agree on num_kv_heads"
+        raise ValueError(msg)
+    if q.device != k.device or q.device != v.device:
+        msg = "q, k, and v must be on the same device"
+        raise ValueError(msg)
+    _num_queries_per_kv(q.shape[1], k.shape[1])
+
+
+def causal_attention_torch_ref(
     q: torch.Tensor,  # (batch_size, num_q_heads, seq_len, head_dim)
     k: torch.Tensor,  # (batch_size, num_kv_heads, seq_len, head_dim)
     v: torch.Tensor,  # (batch_size, num_kv_heads, seq_len, head_dim)
@@ -108,16 +166,11 @@ def causal_attention(
     keep ``q @ k`` and ``attn @ v`` in the incoming activation dtype, but run
     the softmax logits/probabilities in ``float32`` for numerical stability.
     """
+    _validate_causal_attention_inputs(q, k, v)
     num_q_heads = q.shape[1]
     num_kv_heads = k.shape[1]
-    if num_q_heads % num_kv_heads != 0:
-        msg = (
-            f"num_q_heads ({num_q_heads}) must be "
-            f"divisible by num_kv_heads ({num_kv_heads})"
-        )
-        raise ValueError(msg)
     if num_q_heads != num_kv_heads:
-        repeat_factor = num_q_heads // num_kv_heads
+        repeat_factor = _num_queries_per_kv(num_q_heads, num_kv_heads)
         k = k.repeat_interleave(repeat_factor, dim=1)
         v = v.repeat_interleave(repeat_factor, dim=1)
 
@@ -133,20 +186,67 @@ def causal_attention(
     return torch.einsum("bhij,bhjd->bhid", attn, v)
 
 
-class QwenMLP(nn.Module):
-    """SwiGLU-based MLP: gate + up projection, SiLU activation, down projection."""
+def causal_attention(
+    q: torch.Tensor,  # (batch_size, num_q_heads, seq_len, head_dim)
+    k: torch.Tensor,  # (batch_size, num_kv_heads, seq_len, head_dim)
+    v: torch.Tensor,  # (batch_size, num_kv_heads, seq_len, head_dim)
+    *,
+    backend: PrefillAttentionBackend = "torch_ref",
+) -> torch.Tensor:
+    """Compute prefill causal attention with an explicit backend."""
+    _validate_causal_attention_inputs(q, k, v)
+    if backend not in {"torch_ref", "triton"}:
+        msg = f"Unsupported causal attention backend: {backend}"
+        raise ValueError(msg)
+    if backend == "torch_ref":
+        return causal_attention_torch_ref(q, k, v)
+    if not triton_causal_attention_supported(q, k, v):
+        msg = "Triton causal attention backend is not available for these inputs"
+        raise RuntimeError(msg)
+    return causal_attention_triton(q, k, v)
 
-    def __init__(self, hidden_size: int, intermediate_size: int) -> None:
-        """Initialize projections for SwiGLU MLP."""
+
+class QwenMLP(nn.Module):
+    """SwiGLU-based MLP with merged gate/up projection."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        *,
+        backend: MLPBackend = "torch_ref",
+    ) -> None:
+        """Initialize merged gate/up projection plus down projection."""
         super().__init__()
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.gate_up_proj = nn.Linear(hidden_size, 2 * intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.act = nn.SiLU()
+        self.backend = backend
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply SwiGLU: down(act(gate(x)) * up(x))."""
-        return self.down_proj(self.act(self.gate_proj(x)) * self.up_proj(x))
+        """Apply SwiGLU: down(silu(gate_up(x)[:I]) * gate_up(x)[I:])."""
+        gate, up = self._gate_up_proj(x).chunk(2, dim=-1)
+        return self._down_proj(self.act(gate) * up)
+
+    def _gate_up_proj(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the merged gate/up projection with backend dispatch."""
+        if self.backend == "torch_ref":
+            return self.gate_up_proj(x)
+        packed_weight = get_packed_linear_weight(self.gate_up_proj)
+        if not triton_linear_supported(x, packed_weight):
+            msg = "Triton MLP backend is not available for these gate_up inputs"
+            raise RuntimeError(msg)
+        return gate_up_proj_triton(x, packed_weight)
+
+    def _down_proj(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the down projection with backend dispatch."""
+        if self.backend == "torch_ref":
+            return self.down_proj(x)
+        packed_weight = get_packed_linear_weight(self.down_proj)
+        if not triton_linear_supported(x, packed_weight):
+            msg = "Triton MLP backend is not available for these down_proj inputs"
+            raise RuntimeError(msg)
+        return down_proj_triton(x, packed_weight)
 
 
 class QwenAttention(nn.Module):

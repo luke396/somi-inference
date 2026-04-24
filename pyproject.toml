@@ -10,6 +10,11 @@ dependencies = [
     "transformers>=4.48.0",
 ]
 
+[project.optional-dependencies]
+triton = [
+    "triton>=3.6.0",
+]
+
 [dependency-groups]
 dev = [
     "pre-commit>=4.0.0",
@@ -52,6 +57,7 @@ markers = [
 [tool.ruff]
 line-length = 88
 extend-exclude = ["tests", "scripts"]
+force-exclude = true
 
 [tool.ruff.lint]
 select = ["ALL"]

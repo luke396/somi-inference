@@ -1,7 +1,9 @@
 """Tests for QwenModel."""
 
+from typing import cast
+
 import torch
-from somi_inference.models.qwen2 import QwenModel
+from somi_inference.models.qwen2 import QwenDecoderLayer, QwenModel
 
 
 class TestQwenModel:
@@ -108,8 +110,10 @@ class TestQwenModel:
         input_ids = torch.randint(0, 100, (1, 8))
         out = model(input_ids, make_forward_context(seq_len=8))
         out.sum().backward()
+        first_layer = cast(QwenDecoderLayer, model.layers[0])
+        second_layer = cast(QwenDecoderLayer, model.layers[1])
 
         assert model.token_embedding.weight.grad is not None
-        assert model.layers[0].self_attn.q_proj.weight.grad is not None
-        assert model.layers[1].mlp.gate_proj.weight.grad is not None
+        assert first_layer.self_attn.q_proj.weight.grad is not None
+        assert second_layer.mlp.gate_up_proj.weight.grad is not None
         assert model.final_layernorm.weight.grad is not None

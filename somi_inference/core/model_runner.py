@@ -31,7 +31,7 @@ class ModelRunner:
         assert input_ids.size(0) == 1, "prefill expects a single sequence"
         logits = self.adapter.prefill(input_ids, self.kv_manager, seq_id)
         sampled_token = self.sampler.sample(
-            logits[:, -1, :],
+            logits[:, 0, :],
             sampling_params,
             token_histories=[input_ids[0].tolist()],
         )
